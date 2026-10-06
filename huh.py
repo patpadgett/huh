@@ -178,7 +178,9 @@ def q(s: str) -> str:
 
 def printf_literal(s: str) -> str:
     """A printf command reproducing *s* byte for byte, even when it holds invisible characters
-    (so a receipt stays copy-pasteable instead of carrying the invisible bytes)."""
+    (so a receipt stays copy-pasteable instead of carrying the invisible bytes).
+    Octal \\ooo escapes are the only ones POSIX printf guarantees; \\x and \\u are missing from
+    dash and from macOS's bash 3.2."""
     if s and all(32 <= ord(c) < 127 for c in s):
         return "printf %s " + q(s)
     parts = []
@@ -192,10 +194,8 @@ def printf_literal(s: str) -> str:
             parts.append("\\\\")
         elif ch == "'":
             parts.append("'\\''")
-        elif cp < 0x10000:
-            parts.append(f"\\u{cp:04x}")
         else:
-            parts.append(f"\\U{cp:08x}")
+            parts.append("".join(f"\\{b:03o}" for b in ch.encode("utf-8", "surrogateescape")))
     return "printf '" + "".join(parts) + "'"
 
 
@@ -624,6 +624,8 @@ def parse_date(s: str) -> tuple[dt.datetime, str, bool] | None:
     iso_text = text.replace(" ", "T", 1) if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d.*", text) else text
     if iso_text.endswith(("Z", "z")):
         iso_text = iso_text[:-1] + "+00:00"
+    # Python < 3.11 fromisoformat accepts only 3 or 6 fractional digits; trim nanoseconds.
+    iso_text = re.sub(r"(\.\d{6})\d+", r"\1", iso_text)
     parsed = None
     how = ""
     try:

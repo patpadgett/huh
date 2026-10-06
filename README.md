@@ -138,7 +138,7 @@ unicode          1 hidden character (ZERO WIDTH SPACE)
                  offset 3: U+200B  ZERO WIDTH SPACE  [Cf]  utf-8 e2 80 8b  \u200b  <- format character - invisible
                  without the invisible characters: café
                  5 characters, 8 bytes UTF-8
-                 $ printf 'caf\u200b\u00e9' | uconv -x 'any-name'
+                 $ printf 'caf\342\200\213\303\251' | uconv -x 'any-name'
 ```
 
 It also catches bidi overrides (`\u202e`), Cyrillic/Greek lookalike letters in
@@ -219,7 +219,8 @@ answer. They are built with shell-safe quoting, use tools that exist on an
 ordinary Linux/macOS box (`date`, `base64`, `xxd`, `numfmt`, `jq`,
 `systemd-analyze`, `getent`, `ssh-keygen`, `stat`, `kill -l`), and are
 *printed, never run*. When the input contains invisible characters the receipt
-spells them as `\u200b` so it stays copy-pasteable.
+spells them as octal byte escapes (`\342\200\213`), the one form every
+POSIX `printf` understands, so it stays copy-pasteable in bash, zsh and dash.
 
 Secrets (API tokens, private keys, card numbers) get no receipt at all.
 

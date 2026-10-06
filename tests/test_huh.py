@@ -753,10 +753,12 @@ class SafetyTests(unittest.TestCase):
                     self.assertEqual(out, text, cmd)
 
     def test_printf_literal_round_trips(self):
+        shells = [sh for sh in ("bash", "dash", "sh", "zsh") if huh.have(sh)]
         for text in ["plain", "a'b", "50%", "back\\slash", "caf\u200b\u00e9", "\u202eevil", "tab\tx", "😀", "$(id)"]:
             cmd = huh.printf_literal(text)
-            out = subprocess.run(["bash", "-c", cmd], capture_output=True, timeout=5).stdout
-            self.assertEqual(out.decode("utf-8"), text, cmd)
+            for sh in shells:
+                out = subprocess.run([sh, "-c", cmd], capture_output=True, timeout=5).stdout
+                self.assertEqual(out.decode("utf-8"), text, f"{sh}: {cmd}")
 
     def test_input_size_limit(self):
         with self.assertRaises(ValueError):
