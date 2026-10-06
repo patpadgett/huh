@@ -29,7 +29,7 @@ runs the receipts; it only prints them.
 ## Install
 
 ```sh
-pipx install git+https://github.com/patpadgett/huh      # or: pip install git+...
+pipx install whatsthis         # or: pip install whatsthis
 huh --version
 ```
 
