@@ -50,7 +50,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 MAX_INPUT = 64 * 1024   # bytes accepted from argv, stdin or the clipboard
 MAX_DEPTH = 3           # base64 -> JSON -> epoch is depth 3

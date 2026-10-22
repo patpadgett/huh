@@ -193,9 +193,11 @@ byte size        1,572,864 bytes (1.5 MiB / 1.573 MB)
 ```
 $ huh '2024-03-10 02:30'
 date             Sun 2024-03-10 02:30:00 EST (zone assumed), 2 years 6 months ago
+                 read as ISO 8601
                  2024-03-10 02:30 does not exist in America/New_York: clocks jumped forward over it (DST gap); the next real instant is Sun 2024-03-10 03:30:00 EDT
                  if UTC: Sat 2024-03-09 21:30:00 EST
                  epoch 1710055800, 2 years 6 months ago
+                 Sunday, day 70 of 2024, ISO week 10
                  $ TZ=America/New_York date -d @1710055800
 ```
 
