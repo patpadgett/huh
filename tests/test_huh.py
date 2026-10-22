@@ -95,6 +95,13 @@ class EpochTests(unittest.TestCase):
         r = best("1696500000.5")
         self.assertEqual(r.kind, "epoch seconds")
         self.assertIn("10:00:00.5", r.summary)
+        self.assertEqual(r.receipt, "date -u -d @1696500000.5")
+
+    def test_nanoseconds_keep_all_digits(self):
+        r = best("1696500000123456789")
+        self.assertIn("2023-10-05T10:00:00.123456789Z", joined(r))
+        self.assertEqual(r.data["nanos"], 123456789)
+        self.assertIn("@1696500000.123456789", r.receipt)
 
     def test_local_zone_and_receipt(self):
         r = best("1696500000", tz="America/New_York")
@@ -145,6 +152,13 @@ class DateTests(unittest.TestCase):
         r = find("2024-01-01 09:00 EST", "date")
         self.assertIn("2024-01-01T14:00:00Z", joined(r))
 
+    def test_receipts_use_the_computed_epoch(self):
+        r = find("2024-01-01 09:00", "date", tz="America/New_York")
+        self.assertEqual(r.receipt, "TZ=America/New_York date -d @1704117600")
+        r = find("2024-01-01T12:30:00Z", "date", tz="Asia/Tokyo")
+        self.assertIn("date -u -d @1704112200", r.receipt)
+        self.assertIn("TZ=Asia/Tokyo date -d @1704112200", r.receipt)
+
     def test_dst_gap_and_fold_flagged(self):
         gap = find("2024-03-10 02:30", "date", tz="America/New_York")
         self.assertIn("does not exist", joined(gap))
@@ -165,12 +179,30 @@ class DateTests(unittest.TestCase):
         r2 = find("14:00 UTC", "time", tz="America/New_York")
         self.assertIn("10:00 EDT", r2.summary)
         self.assertIn("12:00 EST", find("noon EST", "time").summary)
+        r3 = find("noon UTC", "time")
+        self.assertTrue(r3.summary.endswith("the same everywhere you asked"))
+        self.assertIn("@1791288000", r3.receipt)
 
     def test_strftime(self):
         r = find("%Y-%m-%dT%H:%M:%S%z", "strftime")
         self.assertIn("2026-10-06T14:00:00+0000", r.summary)
         self.assertEqual(r.receipt, "date +%Y-%m-%dT%H:%M:%S%z")
         self.assertEqual(find("%F %T", "strftime").receipt, "date '+%F %T'")
+        self.assertTrue(find("%Y-%m-%d %f", "strftime").receipt.startswith("python3 -c"))
+
+
+class ReceiptReplayTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "GNU date receipts")
+    def run_receipt(self, receipt):
+        return subprocess.run(["bash", "-c", receipt], capture_output=True, text=True, timeout=5).stdout
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "GNU date receipts")
+    def test_date_and_epoch_receipts_replay(self):
+        self.assertIn("10:00:00", self.run_receipt(find("1696500000.5", "epoch seconds").receipt))
+        self.assertIn("10:00:00.123456789", self.run_receipt(find("1696500000123456789", "epoch nanos").receipt))
+        self.assertIn("09:00:00 EST", self.run_receipt(find("2024-01-01 09:00", "date", tz="America/New_York").receipt))
+        self.assertIn("12:00:00", self.run_receipt(find("noon UTC", "time").receipt))
+        self.assertIn("Dec 24", self.run_receipt(find("1341923634421944320", "snowflake").receipt))
 
 
 class DurationTests(unittest.TestCase):
@@ -389,6 +421,41 @@ class EncodingTests(unittest.TestCase):
         self.assertIn("’", best("â€™").summary)
 
 
+class SecretOutputTests(unittest.TestCase):
+    def test_url_credentials_are_masked_and_get_no_receipt(self):
+        url = "https://alice:" + "s3cr3t" + "@example.com/path?token=" + "abcdefghijk" + "&x=1696500000"
+        r = find(url, "url")
+        self.assertIsNone(r.receipt)
+        text = joined(r)
+        self.assertNotIn("s3cr3t", text)
+        self.assertNotIn("abcdefghijk", text)
+        self.assertIn("<password>", text)
+        self.assertIn("<redacted>", text)
+        self.assertTrue(r.data["redacted"])
+        self.assertIn("epoch seconds", [c.kind for c in r.children])
+
+    def test_url_encoded_credentials_are_masked(self):
+        text = "https%3A%2F%2Falice%3As3cr3t%40example.com%2F"
+        r = find(text, "url-encoded")
+        self.assertIsNone(r.receipt)
+        self.assertNotIn("s3cr3t", joined(r))
+        self.assertTrue(r.data["redacted"])
+
+    def test_json_credentials_are_masked(self):
+        text = '{"config":{"password":"hunter2"},"created":1696500000}'
+        r = find(text, "json")
+        self.assertIsNone(r.receipt)
+        self.assertNotIn("hunter2", joined(r))
+        self.assertIn("<redacted>", joined(r))
+        self.assertTrue(r.data["redacted"])
+        self.assertIn("epoch seconds", [c.kind for c in r.children])
+
+    def test_plain_url_keeps_its_receipt(self):
+        r = find("https://example.com/path?x=1696500000", "url")
+        self.assertIsNotNone(r.receipt)
+        self.assertFalse(r.data["redacted"])
+
+
 class UnicodeTests(unittest.TestCase):
     def test_zero_width_space(self):
         r = best("caf\u200b\u00e9")
@@ -558,6 +625,7 @@ class IdentifierTests(unittest.TestCase):
         r = find("1341923634421944320", "snowflake")
         self.assertIn("Twitter/X", r.summary)
         self.assertIn("2020-12-24", r.data["iso"])
+        self.assertIn("/ 1000", r.receipt)
 
     def test_ip(self):
         r = best("192.168.1.10:8080")
@@ -858,6 +926,19 @@ class CLITests(unittest.TestCase):
         self.assertEqual(data["input"], "137")
         self.assertEqual(data["readings"][0]["kind"], "exit code")
         self.assertLessEqual(len(data["readings"]), 5)
+
+    def test_json_exit_code_reflects_readings(self):
+        p = self.run_cli("--json", "hello")
+        self.assertEqual(p.returncode, 1)
+        self.assertEqual(json.loads(p.stdout)["readings"], [])
+
+    def test_json_escapes_bidi_and_redacts_secrets(self):
+        p = self.run_cli("--json", "\u202eevil")
+        self.assertNotIn("\u202e", p.stdout)
+        self.assertIn("\\u202e", p.stdout)
+        p = self.run_cli("--json", '{"password":"hunter2"}')
+        self.assertNotIn("hunter2", p.stdout)
+        self.assertTrue(json.loads(p.stdout)["input_redacted"])
 
     def test_all_and_max_and_type(self):
         few = json.loads(self.run_cli("--json", "137").stdout)["readings"]

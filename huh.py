@@ -293,10 +293,13 @@ def fmt(d: dt.datetime, zone: dt.tzinfo | None = None, seconds: bool = True, nan
     return f"{text} {zone_label(d)}"
 
 
-def iso(d: dt.datetime) -> str:
+def iso(d: dt.datetime, nanos: int | None = None) -> str:
     d = d.astimezone(UTC)
     text = d.strftime("%Y-%m-%dT%H:%M:%S")
-    if d.microsecond:
+    if nanos is not None:
+        if nanos:
+            text += ("." + f"{nanos:09d}").rstrip("0")
+    elif d.microsecond:
         text += ("." + f"{d.microsecond:06d}").rstrip("0")
     return text + "Z"
 
@@ -560,14 +563,15 @@ def detect_epoch(s: str, ctx: Context):
         digits_note = f"{plural(len(whole_digits), 'digit')}, read as {unit} since 1970-01-01 UTC"
         local = d.astimezone(ctx.zone)
         show_nanos = nanos if divisor >= 10**6 else None
-        receipt = epoch_receipt(whole_digits if not negative else "-" + whole_digits, divisor, ctx.zone)
+        numeric = ("-" if negative else "") + whole_digits + ("." + frac_digits if frac_digits else "")
+        receipt = epoch_receipt(numeric, divisor, ctx.zone)
         if conf < 0.4:
             unlikely.append((conf, kind, unit, d, local, show_nanos, receipt, digits_note))
             continue
         lines = zone_lines(d, ctx, skip_offset=local.utcoffset(), nanos=show_nanos)
-        lines.append(f"ISO {iso(d)}  -  {digits_note}")
+        lines.append(f"ISO {iso(d, show_nanos)}  -  {digits_note}")
         out.append(Reading(kind, conf, f"{fmt(local, nanos=show_nanos)}, {relative(d, ctx.now)}", lines, receipt,
-                           data={"iso": iso(d), "unit": unit, "seconds": secs}))
+                           data={"iso": iso(d, show_nanos), "unit": unit, "seconds": secs, "nanos": nanos}))
     if unlikely and not out:
         # Nothing plausible: one compact reading instead of four lines of 1970.
         unlikely.sort(key=lambda u: -u[0])
@@ -577,7 +581,7 @@ def detect_epoch(s: str, ctx: Context):
         if others:
             lines.append(f"other units: {others}")
         out.append(Reading(kind, conf, f"{fmt(local, nanos=show_nanos)} if {unit} - unlikely", lines, receipt,
-                           data={"iso": iso(d), "unit": unit}))
+                           data={"iso": iso(d, show_nanos), "unit": unit}))
     # Windows FILETIME: 100 ns ticks since 1601-01-01, 18 digits around now.
     if len(whole_digits) == 18 and not frac_digits and not negative:
         secs = whole / 10**7 - 11644473600
@@ -658,12 +662,15 @@ def parse_date(s: str) -> tuple[dt.datetime, str, bool] | None:
     return parsed, how, parsed.tzinfo is not None
 
 
-def date_receipt(s: str, zone: dt.tzinfo, aware: bool) -> str:
+def date_receipt(epoch: int, zone: dt.tzinfo, aware: bool) -> str:
+    """A portable-enough receipt for an instant. Using @epoch avoids re-parsing the original text."""
     key = zone_key(zone)
-    core = q(s)
-    if aware or key in ("UTC", "Etc/UTC"):
-        return f"date -u -d {core}; date -d {core} +%s"
-    return f"TZ={q(key)} date -d {core}; TZ={q(key)} date -d {core} +%s"
+    base = f"date -u -d @{epoch}"
+    if aware or key in ("UTC", "Etc/UTC") or "/" not in key:
+        if key not in ("UTC", "Etc/UTC") and "/" in key:
+            return f"{base}   # local: TZ={q(key)} date -d @{epoch}"
+        return base
+    return f"TZ={q(key)} date -d @{epoch}"
 
 
 @detector
@@ -711,7 +718,7 @@ def detect_date(s: str, ctx: Context):
     summary = f"{fmt(instant, ctx.zone) if aware else fmt(instant)}, {relative(instant, ctx.now)}"
     if not aware:
         summary = f"{fmt(d.replace(tzinfo=ctx.zone))} (zone assumed), {relative(instant, ctx.now)}"
-    return [Reading("date", conf, summary, lines, date_receipt(s, ctx.zone, aware),
+    return [Reading("date", conf, summary, lines, date_receipt(epoch, ctx.zone, aware),
                     data={"iso": iso(instant), "epoch": epoch, "zone_given": aware})]
 
 
@@ -746,20 +753,21 @@ def detect_time_of_day(s: str, ctx: Context):
         source_zone, notes = ctx.zone, []
     today = ctx.now.astimezone(source_zone).date()
     wall = dt.datetime(today.year, today.month, today.day, hour, minute, second, tzinfo=source_zone)
+    line_fmt = "%H:%M:%S" if second else "%H:%M"
     lines = list(notes)
-    lines.append(f"{wall.strftime('%H:%M')} {label or zone_key(source_zone)} today is:")
+    lines.append(f"{wall.strftime(line_fmt)} {label or zone_key(source_zone)} today is:")
     lines.extend("  " + line for line in zone_lines(wall, ctx, skip_offset=wall.utcoffset()))
     if not any(wall.astimezone(z).utcoffset() == dt.timedelta(0) for z in ctx.zones) and wall.utcoffset() != dt.timedelta(0):
         lines.append(f"  {fmt(wall, UTC)}")
     conf = 0.85 if zone_token else 0.5
     if m_word:
         conf = 0.8 if zone_token else 0.6
-    receipt = f"date -d 'TZ=\"{zone_key(source_zone)}\" {hour:02d}:{minute:02d}'" if "/" in zone_key(source_zone) \
-        else f"date -d {q(f'{hour:02d}:{minute:02d} {label or zone_key(source_zone)}')}"
-    return [Reading("time", conf, f"{wall.strftime('%H:%M')} {label or zone_key(source_zone)} = "
-                    + ", ".join(f"{wall.astimezone(z).strftime('%H:%M')} {zone_label(wall.astimezone(z))}" for z in ctx.zones
-                                if wall.astimezone(z).utcoffset() != wall.utcoffset()) or "the same everywhere you asked",
-                    lines, receipt)]
+    converted = ", ".join(f"{wall.astimezone(z).strftime('%H:%M')} {zone_label(wall.astimezone(z))}" for z in ctx.zones
+                          if wall.astimezone(z).utcoffset() != wall.utcoffset())
+    receipt = date_receipt(int(wall.timestamp()), source_zone, True)
+    return [Reading("time", conf, f"{wall.strftime(line_fmt)} {label or zone_key(source_zone)} = "
+                    + (converted or "the same everywhere you asked"), lines, receipt,
+                    data={"epoch": int(wall.timestamp())})]
 
 
 DURATION_UNITS = {
@@ -1204,15 +1212,19 @@ def detect_strftime(s: str, ctx: Context):
     codes = re.findall(r"%:?[a-zA-Z%]", s)
     if not codes or len(s) > 80 or not all(c in STRFTIME for c in codes):
         return None
-    if len(codes) < 2 and "%" + s.strip("%") == s:
-        pass
     try:
         rendered = ctx.now.astimezone(ctx.zone).strftime(s.replace("%N", f"{(ctx.now.microsecond * 1000):09d}").replace("%:z", "%z"))
     except ValueError:
         return None
     lines = [f"now: {clean(rendered)}"]
     lines.extend(f"{c}  {STRFTIME[c]}" for c in dict.fromkeys(codes))
-    receipt = f"date +{s}" if re.fullmatch(r"[\w%:+-]+", s) else f"date {q('+' + s)}"
+    if "%f" in s or "%N" in s:
+        # GNU date has %N but not %f; Python has %f but not %N. One portable receipt covers both.
+        py = ("python3 -c 'import datetime,sys; n=datetime.datetime.now().astimezone(); "
+              "print(n.strftime(sys.argv[1].replace(\"%N\", f\"{n.microsecond*1000:09d}\")))'")
+        receipt = f"{py} {q(s)}"
+    else:
+        receipt = f"date +{s}" if re.fullmatch(r"[\w%:+-]+", s) else f"date {q('+' + s)}"
     return [Reading("strftime", 0.85 if len(codes) > 1 or s.startswith("%") else 0.5,
                     f"date/strftime format -> {clean(rendered)}", lines, receipt)]
 
@@ -1333,12 +1345,17 @@ def detect_url_encoded(s: str, ctx: Context):
     if text is None or text == s:
         return None
     plus_text = urllib.parse.unquote_plus(s) if "+" in s else None
-    lines = [f"-> {preview(text, 96)}"]
+    secret = contains_secret(text) or bool(plus_text and contains_secret(plus_text))
+    shown = redact_text(text) if secret else text
+    lines = [f"-> {preview(shown, 96)}"]
     if plus_text and plus_text != text:
-        lines.append(f"-> {preview(plus_text, 96)}  (if + means space, as in form data)")
-    children = nested(text, ctx)
-    receipt = f"python3 -c 'import sys,urllib.parse; print(urllib.parse.unquote(sys.argv[1]))' {q(s)}"
-    return [Reading("url-encoded", 0.9, f"percent-encoded -> {preview(text, 60)}", lines, receipt, children)]
+        lines.append(f"-> {preview(redact_text(plus_text) if secret else plus_text, 96)}  (if + means space, as in form data)")
+    if secret:
+        lines.append("decoded text looks like a credential: values are masked and no receipt is offered")
+    children = [] if secret else nested(text, ctx)
+    receipt = None if secret else f"python3 -c 'import sys,urllib.parse; print(urllib.parse.unquote(sys.argv[1]))' {q(s)}"
+    return [Reading("url-encoded", 0.9, f"percent-encoded -> {preview(shown, 60)}", lines, receipt, children,
+                    data={"redacted": secret})]
 
 
 @detector
@@ -1351,22 +1368,34 @@ def detect_url(s: str, ctx: Context):
                          f"clone: git clone {clean(s)}"], f"git ls-remote {q(s)}   # lists refs without cloning (needs network)")]
     if len(s) > 4096 or " " in s.strip() or not re.match(r"[a-zA-Z][a-zA-Z0-9+.-]*://\S+|mailto:|^[\w.-]+\.[a-z]{2,}(?:[/?#]\S*)$", s):
         return None
-    u = urllib.parse.urlsplit(s if "://" in s or s.startswith("mailto:") else "//" + s)
+    try:
+        u = urllib.parse.urlsplit(s if "://" in s or s.startswith("mailto:") else "//" + s)
+        hostname = u.hostname
+    except ValueError:
+        return None
     if not (u.netloc or u.scheme == "mailto"):
         return None
+    secret = contains_secret(s)
+    try:
+        port = u.port
+        bad_port = None
+    except ValueError:
+        port = None
+        mport = re.search(r":(\d+)$", u.netloc)
+        bad_port = mport.group(1) if mport else "?"
     lines = []
     if u.scheme:
         lines.append(f"scheme   {u.scheme}")
     if u.username or u.password:
-        lines.append(f"userinfo {u.username or ''}{':<password>' if u.password else ''}   (credentials in a URL leak in logs and history)")
-    if u.hostname:
-        host = u.hostname
+        lines.append(f"userinfo {clean(urllib.parse.unquote(u.username or ''))}{':<password>' if u.password else ''}   (credentials in a URL leak in logs and history)")
+    if hostname:
+        host = hostname
         try:
             host_ascii = host.encode("idna").decode()
         except UnicodeError:
             host_ascii = host
-        lines.append(f"host     {clean(host)}" + (f"  (punycode {host_ascii})" if host_ascii != host else "")
-                     + (f"  port {u.port}" if u.port else ""))
+        port_note = f"  port {port}" if port else (f"  port {bad_port} is out of range (1-65535)" if bad_port else "")
+        lines.append(f"host     {clean(host)}" + (f"  (punycode {host_ascii})" if host_ascii != host else "") + port_note)
         if host.startswith("xn--") or any(part.startswith("xn--") for part in host.split(".")):
             try:
                 lines.append(f"         decodes to {clean(host.encode().decode('idna'))}")
@@ -1378,26 +1407,50 @@ def detect_url(s: str, ctx: Context):
         except ValueError:
             pass
     if u.path and u.path != "/":
-        lines.append(f"path     {clean(urllib.parse.unquote(u.path))}")
+        path_text = urllib.parse.unquote(u.path)
+        lines.append(f"path     {clean(redact_text(path_text) if secret else path_text)}")
     children: list[Reading] = []
-    if u.query:
-        params = urllib.parse.parse_qsl(u.query, keep_blank_values=True)
+    params = urllib.parse.parse_qsl(u.query, keep_blank_values=True) if u.query else []
+    query_secret = False
+    if params:
         lines.append(f"query    {plural(len(params), 'parameter')}")
         for k, v in params[:12]:
-            lines.append(f"  {clean(k)} = {preview(v, 60)}")
-            if ctx.budget[0] > 8 and len(v) >= 6:
+            sensitive = bool(_SENSITIVE_KEY_RE.match(k))
+            value_secret = sensitive or (secret and contains_secret(v))
+            query_secret = query_secret or value_secret
+            shown = "<redacted>" if sensitive else preview(redact_text(v) if secret else v, 60)
+            lines.append(f"  {clean(k)} = {shown}")
+            if not value_secret and ctx.budget[0] > 8 and len(v) >= 6:
                 for r in nested(v, ctx, 0.7, 1):
                     if r.kind not in ("number", "hex", "chmod", "port", "http status", "exit code", "base64"):
                         r.via = k
                         children.append(r)
     if u.fragment:
-        lines.append(f"fragment {preview(u.fragment, 60)}")
-    receipt = f"python3 -c 'import sys,urllib.parse; print(urllib.parse.urlsplit(sys.argv[1]))' {q(s)}"
-    if have("trurl"):
+        lines.append(f"fragment {preview(redact_text(u.fragment) if secret else u.fragment, 60)}")
+    secret = secret or query_secret or bool(u.password)
+    receipt = None if secret else f"python3 -c 'import sys,urllib.parse; print(urllib.parse.urlsplit(sys.argv[1]))' {q(s)}"
+    if receipt and have("trurl"):
         receipt = f"trurl --json {q(s)}"
+    if secret:
+        lines.append("receipt withheld: this URL contains credentials")
     conf = 0.9 if u.scheme else 0.5
-    return [Reading("url", conf, f"URL: {clean(u.hostname or '')}{' ' + clean(urllib.parse.unquote(u.path)) if u.path not in ('', '/') else ''}",
-                    lines, receipt, children)]
+    summary_path = clean(redact_text(urllib.parse.unquote(u.path))) if secret else clean(urllib.parse.unquote(u.path))
+    return [Reading("url", conf, f"URL: {clean(hostname or '')}{' ' + summary_path if u.path not in ('', '/') else ''}",
+                    lines, receipt, children, data={"redacted": secret})]
+
+
+def _json_has_sensitive_key(value, budget: int = 100) -> bool:
+    if budget <= 0:
+        return False
+    if isinstance(value, dict):
+        for k, v in list(value.items())[:40]:
+            if _SENSITIVE_KEY_RE.match(str(k)) or _json_has_sensitive_key(v, budget - 1):
+                return True
+    elif isinstance(value, list):
+        for v in value[:40]:
+            if _json_has_sensitive_key(v, budget - 1):
+                return True
+    return False
 
 
 def _json_walk(value, path: str, ctx: Context, found: list[tuple[str, Reading]], budget: list[int]):
@@ -1434,20 +1487,29 @@ def detect_json(s: str, ctx: Context):
         what = f"JSON object with {plural(len(value), 'key')}"
     else:
         what = f"JSON array with {plural(len(value), 'item')}"
+    secret = contains_secret(s) or _json_has_sensitive_key(value)
     lines = []
     if isinstance(value, dict):
         for k, v in list(value.items())[:8]:
-            lines.append(f"{preview(str(k), 32)}: {preview(json.dumps(v, ensure_ascii=False), 70)}")
+            sensitive = bool(_SENSITIVE_KEY_RE.match(str(k))) or _json_has_sensitive_key(v)
+            dumped = json.dumps(v, ensure_ascii=False)
+            shown = "<redacted>" if sensitive else (redact_text(dumped) if contains_secret(dumped) else dumped)
+            lines.append(f"{preview(str(k), 32)}: {preview(shown, 70)}")
         if len(value) > 8:
             lines.append(f"... {len(value) - 8} more")
+    if secret:
+        lines.append("receipt withheld: this JSON contains a credential")
     found: list[tuple[str, Reading]] = []
     _json_walk(value, "", ctx, found, [12])
     children = []
     for path, r in found[:6]:
         r.via = path
         children.append(r)
-    receipt = f"{printf_literal(s) if len(s) < 500 else 'cat FILE'} | jq ." if have("jq") else f"python3 -m json.tool <<< {q(s)}"
-    return [Reading("json", 0.98, what, lines, receipt, children, data={"keys": list(value)[:40] if isinstance(value, dict) else None})]
+    receipt = None if secret else (
+        f"{printf_literal(s) if len(s) < 500 else 'cat FILE'} | jq ." if have("jq")
+        else f"python3 -m json.tool <<< {q(s)}")
+    return [Reading("json", 0.98, what, lines, receipt, children,
+                    data={"keys": list(value)[:40] if isinstance(value, dict) else None, "redacted": secret})]
 
 
 def b64url_json(segment: str):
@@ -2541,7 +2603,8 @@ def detect_snowflake(s: str, ctx: Context):
             if name == "Discord" and when > ctx.now - dt.timedelta(days=3650) and len(s) == 19 and s[0] == "1":
                 conf = 0.45  # Discord ids in this range would be recent; Twitter is the older, likelier source
             out.append(Reading("snowflake", conf, f"{name} snowflake id from {fmt(when, ctx.zone, seconds=False)}", lines,
-                               f"date -u -d @$(( ({s} >> 22) + {epoch} ))" if name != "Mastodon" else f"date -u -d @$(( ({s} >> 16) / 1000 ))",
+                               f"date -u -d @$(( (({s} >> 22) + {epoch}) / 1000 ))" if name != "Mastodon"
+                               else f"date -u -d @$(( ({s} >> 16) / 1000 ))",
                                data={"service": name, "iso": iso(when)}))
     return out
 
@@ -2965,8 +3028,38 @@ SECRET_PATTERNS = (
     (r"tfr\.[A-Za-z0-9_-]+", "Terraform Cloud token"), (r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", None),  # JWT: handled elsewhere
     (r"-----BEGIN [A-Z ]*PRIVATE KEY-----", None),
     (r"(?i)(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp|mssql)://[^:/\s]+:[^@/\s]+@[^\s]+", "database URL with an embedded password"),
+    (r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@[^\s]+", "URL with an embedded password"),
+    (r"(?i)\"(?:api[_-]?key|auth(?:orization)?|credential|key|passwd|password|pwd|secret|sig(?:nature)?|token)\"\s*:\s*\"[^\"]*\"", "JSON field named like a credential"),
     (r"(?i)(?:api[_-]?key|secret|token|password|passwd|pwd)\s*[=:]\s*['\"]?[A-Za-z0-9_\-/+=]{8,}", "a key=value assignment that looks like a credential"),
 )
+
+# Query keys whose values should not be echoed. This is deliberately conservative.
+_SENSITIVE_KEY_RE = re.compile(r"(?i)^(?:api[_-]?key|auth(?:orization)?|credential|key|passwd|password|pwd|secret|sig(?:nature)?|token)$")
+
+
+def contains_secret(text: str) -> bool:
+    """True when the text matches a known credential shape or a URL with a password."""
+    if len(text) > 4096:
+        return False
+    return any(label is not None and re.search(pattern, text) for pattern, label in SECRET_PATTERNS)
+
+
+def redact_text(text: str) -> str:
+    """Best-effort masking for output. Uses the same patterns as detect_secret, plus key=value forms."""
+    if len(text) > 4096:
+        return "<redacted: input too large>"
+    redacted = text
+    for pattern, label in SECRET_PATTERNS:
+        if label is not None:
+            redacted = re.sub(pattern, "<redacted>", redacted)
+    # Generic user:password@, even when the password contains '@'.
+    redacted = re.sub(r"(?i)(\b[a-z][a-z0-9+.-]*://[^/\s:@]+:)[^/\s]+@", r"\1<redacted>@", redacted)
+    # Query-string and key/value forms that the broad patterns may not catch.
+    redacted = re.sub(r"(?i)(\b(?:api[_-]?key|auth|credential|key|passwd|password|pwd|secret|sig|signature|token)=)[^&\s'\"]+",
+                      r"\1<redacted>", redacted)
+    redacted = re.sub(r"(?i)(\b(?:api[_-]?key|auth|credential|key|passwd|password|pwd|secret|sig|signature|token)\s*:\s*)[^\s,;'\"]+",
+                      r"\1<redacted>", redacted)
+    return redacted
 
 
 @detector
@@ -3514,8 +3607,13 @@ def main(argv: list[str] | None = None) -> int:
         floor = 0.25 if readings and readings[0].confidence >= 0.75 else 0.1
         shown = [r for r in readings if r.confidence >= floor][: max(1, args.max)] or readings[:1]
     if args.json:
-        print(json.dumps({"input": text, "readings": [r.to_dict() for r in shown], "hidden": total - len(shown)}, indent=2, ensure_ascii=False, default=str))
-        return 0
+        safe_text = redact_text(text) if contains_secret(text) else text
+        payload = {"input": safe_text, "readings": [r.to_dict() for r in shown], "hidden": total - len(shown)}
+        if safe_text != text:
+            payload["input_redacted"] = True
+        # ensure_ascii=True keeps bidi overrides and other format characters out of terminal/log output.
+        print(json.dumps(payload, indent=2, ensure_ascii=True, default=str))
+        return 0 if readings else 1
     width = shutil.get_terminal_size((100, 24)).columns if sys.stdout.isatty() else 10_000
     print(render(shown, total, args.all, width))
     return 0 if readings else 1
