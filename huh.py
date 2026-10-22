@@ -460,8 +460,12 @@ TZ_ABBR: dict[str, tuple[str, int | None, str, str | None]] = {
 OFFSET_RE = re.compile(r"(?:UTC|GMT)?\s*([+-])(\d{1,2})(?::?(\d{2}))?", re.I)
 
 
+_ZONE_BY_LOWER: dict[str, str] | None = None
+
+
 def resolve_zone(token: str) -> tuple[dt.tzinfo, str, list[str]] | None:
     """tzinfo for an IANA name, an abbreviation, or an offset: (tz, label, notes)."""
+    global _ZONE_BY_LOWER
     t = token.strip()
     if not t:
         return None
@@ -470,6 +474,16 @@ def resolve_zone(token: str) -> tuple[dt.tzinfo, str, list[str]] | None:
         try:
             return ZoneInfo(name), name, []
         except (ZoneInfoNotFoundError, ValueError, OSError):
+            if "/" not in t:
+                return None
+            if _ZONE_BY_LOWER is None:
+                _ZONE_BY_LOWER = {z.lower(): z for z in available_timezones()}
+            canonical = _ZONE_BY_LOWER.get(t.lower())
+            if canonical:
+                try:
+                    return ZoneInfo(canonical), canonical, []
+                except (ZoneInfoNotFoundError, ValueError, OSError):
+                    pass
             return None
     m = OFFSET_RE.fullmatch(t)
     if m:
@@ -733,8 +747,6 @@ def detect_time_of_day(s: str, ctx: Context):
     m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?(?::(\d{2}))?\s*([ap]\.?m\.?)?(?:\s+(\S+))?", text, re.I)
     if not m or (not m.group(2) and not m.group(4)):
         return None
-    if m.group(3) and not m.group(5) and not m.group(4) and ctx.depth == 0 and int(m.group(1)) < 24:
-        pass  # "01:30:00" reads as both a duration and a time; let both speak
     hour, minute, second = int(m.group(1)), int(m.group(2) or 0), int(m.group(3) or 0)
     ampm, zone_token = m.group(4), m.group(5)
     if ampm:
@@ -987,7 +999,7 @@ def cron_english(mins: CronField, hours: CronField, dom: CronField, mon: CronFie
 
 
 def cron_next(fields: tuple[CronField, ...], zone: dt.tzinfo, now: dt.datetime, count: int = 3,
-              horizon_days: int = 366 * 5) -> tuple[list[dt.datetime], list[str]]:
+              horizon_days: int = 366 * 5, seconds: CronField | None = None) -> tuple[list[dt.datetime], list[str]]:
     """Next *count* fire times after *now*, honest about DST: a wall time that does not exist
     (spring forward) is skipped; one that happens twice (fall back) is listed once, the first time."""
     mins, hours, dom, mon, dow = fields
@@ -996,6 +1008,8 @@ def cron_next(fields: tuple[CronField, ...], zone: dt.tzinfo, now: dt.datetime, 
     start_local = now.astimezone(zone)
     day = start_local.date()
     hour_list, min_list = sorted(hours.values), sorted(mins.values)
+    sec_list = sorted(seconds.values) if seconds else [0]
+    stamp = "%H:%M:%S" if seconds else "%H:%M"
     for offset in range(horizon_days):
         date = day + dt.timedelta(days=offset)
         if date.month not in mon.values:
@@ -1006,26 +1020,28 @@ def cron_next(fields: tuple[CronField, ...], zone: dt.tzinfo, now: dt.datetime, 
             continue
         for h in hour_list:
             for m in min_list:
-                naive = dt.datetime(date.year, date.month, date.day, h, m)
-                aware = naive.replace(tzinfo=zone, fold=0)
-                # Verify the wall time exists: round-trip through UTC.
-                back = aware.astimezone(UTC).astimezone(zone)
-                if back.replace(tzinfo=None) != naive:
-                    if aware > now and len(notes) < 2:
-                        notes.append(f"{naive:%Y-%m-%d %H:%M} does not exist in {zone_key(zone)} (clocks jump forward); skipped")
-                    continue
-                if aware <= now:
-                    continue
-                found.append(aware)
-                if aware.replace(fold=1).utcoffset() != aware.utcoffset() and len(notes) < 2:
-                    notes.append(f"{naive:%Y-%m-%d %H:%M} happens twice in {zone_key(zone)} (clocks fall back); "
-                                 "most cron daemons run it once, some twice")
-                if len(found) >= count:
-                    return found, notes
+                for s in sec_list:
+                    naive = dt.datetime(date.year, date.month, date.day, h, m, s)
+                    aware = naive.replace(tzinfo=zone, fold=0)
+                    # Verify the wall time exists: round-trip through UTC.
+                    back = aware.astimezone(UTC).astimezone(zone)
+                    if back.replace(tzinfo=None) != naive:
+                        if aware > now and len(notes) < 2:
+                            notes.append(f"{naive.strftime('%Y-%m-%d ' + stamp)} does not exist in {zone_key(zone)} (clocks jump forward); skipped")
+                        continue
+                    if aware <= now:
+                        continue
+                    found.append(aware)
+                    if aware.replace(fold=1).utcoffset() != aware.utcoffset() and len(notes) < 2:
+                        notes.append(f"{naive.strftime('%Y-%m-%d ' + stamp)} happens twice in {zone_key(zone)} (clocks fall back); "
+                                     "most cron daemons run it once, some twice")
+                    if len(found) >= count:
+                        return found, notes
     return found, notes
 
 
-def cron_to_systemd(mins: CronField, hours: CronField, dom: CronField, mon: CronField, dow: CronField) -> str | None:
+def cron_to_systemd(mins: CronField, hours: CronField, dom: CronField, mon: CronField, dow: CronField,
+                    seconds: CronField | None = None) -> str | None:
     """OnCalendar= form for the same schedule, when the schedule is expressible."""
     def part(f: CronField, names: dict | None = None) -> str | None:
         if f.star and f.step in (None, 1):
@@ -1042,7 +1058,8 @@ def cron_to_systemd(mins: CronField, hours: CronField, dom: CronField, mon: Cron
         return ",".join(f"{v:02d}" for v in values)
 
     m_text, h_text, d_text, mo_text = part(mins), part(hours), part(dom), part(mon)
-    if None in (m_text, h_text, d_text, mo_text):
+    s_text = "00" if seconds is None or seconds.values == {0} else part(seconds)
+    if None in (m_text, h_text, d_text, mo_text, s_text):
         return None
     if not (dom.star or dow.star):
         return None  # cron's OR between day fields has no systemd equivalent
@@ -1054,7 +1071,7 @@ def cron_to_systemd(mins: CronField, hours: CronField, dom: CronField, mon: Cron
             weekdays = f"{names[values[0]]}..{names[values[-1]]} "
         else:
             weekdays = ",".join(names[v] for v in values) + " "
-    return f"{weekdays}*-{mo_text}-{d_text} {h_text}:{m_text}:00"
+    return f"{weekdays}*-{mo_text}-{d_text} {h_text}:{m_text}:{s_text}"
 
 
 @detector
@@ -1068,72 +1085,81 @@ def detect_cron(s: str, ctx: Context):
                         ["cron alias; no schedule, no next run", "equivalent systemd unit: WantedBy=multi-user.target with a oneshot service"],
                         None)]
     parts = text.split()
-    command = None
-    if len(parts) > 6 or (len(parts) == 6 and not re.fullmatch(r"[\d*,/-]+", parts[0])):
-        # A crontab line: five fields followed by the command (or, in /etc/crontab, a user then the command).
-        if len(text) > 400 or not all(re.fullmatch(r"[\w*,/-]+", p) for p in parts[:5]) or all(p == "*" for p in parts[5:]):
-            return None
-        command, parts = " ".join(parts[5:]), parts[:5]
-    if len(parts) not in (5, 6) or len(text) > 400:
+    if len(parts) < 5 or len(text) > 400:
         return None
+
+    def parse_fields(field_texts: list[str]) -> tuple[CronField, ...]:
+        return (cron_field(field_texts[0], 0, 59), cron_field(field_texts[1], 0, 23),
+                cron_field(field_texts[2], 1, 31), cron_field(field_texts[3], 1, 12, MONTH_NAMES),
+                cron_field(field_texts[4], 0, 7, DAY_NAMES, sunday7=True))
+
+    command = None
     seconds_field = None
-    if len(parts) == 6:
-        seconds_field, parts = parts[0], parts[1:]   # Quartz/Spring style with a seconds column
-        if not re.fullmatch(r"[\d*,/-]+", seconds_field):
-            return None
+    if len(parts) == 5:
+        field_texts = parts
+    elif len(parts) == 6:
+        # A six-token line is either Quartz-style seconds + five fields, or five fields + a one-word command.
+        try:
+            candidate_seconds = cron_field(parts[0], 0, 59)
+            parse_fields(parts[1:])
+            seconds_field, field_texts = candidate_seconds, parts[1:]
+        except ValueError:
+            command, field_texts = parts[5], parts[:5]
+    else:
+        # Five fields followed by the command (or, in /etc/crontab, a user then the command).
+        command, field_texts = " ".join(parts[5:]), parts[:5]
+    if command is not None and (not command.strip() or all(p == "*" for p in command.split())):
+        return None
     try:
-        mins = cron_field(parts[0], 0, 59)
-        hours = cron_field(parts[1], 0, 23)
-        dom = cron_field(parts[2], 1, 31)
-        mon = cron_field(parts[3], 1, 12, MONTH_NAMES)
-        dow = cron_field(parts[4], 0, 7, DAY_NAMES, sunday7=True)
+        fields = parse_fields(field_texts)
     except ValueError:
         return None
-    fields = (mins, hours, dom, mon, dow)
+    mins, hours, dom, mon, dow = fields
     english = cron_english(*fields)
-    upcoming, notes = cron_next(fields, ctx.zone, ctx.now)
+    upcoming, notes = cron_next(fields, ctx.zone, ctx.now, seconds=seconds_field)
     lines = []
     if alias:
         lines.append(f"{alias} expands to {text}")
-    lines.append("fields: minute hour day-of-month month day-of-week  =  " + "  ".join(parts))
+    lines.append("fields: minute hour day-of-month month day-of-week  =  " + "  ".join(field_texts))
     if command:
-        user_then_command = re.match(r"([a-z_][a-z0-9_-]{0,31})\s+(/.*|[a-z].*)", command)
-        if user_then_command and user_then_command.group(1) in ("root", "www-data", "nobody", "postgres", "backup", "ubuntu", "ec2-user") or \
-                (user_then_command and "/" in user_then_command.group(2)[:1]):
-            lines.append(f"runs as {user_then_command.group(1)}: {preview(user_then_command.group(2), 80)}  (system crontab format)")
+        m = re.match(r"([a-z_][a-z0-9_-]{0,31})\s+(.+)$", command)
+        known_users = ("root", "www-data", "nobody", "postgres", "backup", "ubuntu", "ec2-user")
+        if m and (m.group(1) in known_users or "/" in m.group(2) or m.group(2).startswith(("./", "~"))):
+            lines.append(f"runs as {m.group(1)}: {preview(m.group(2), 80)}  (system crontab format)")
         else:
             lines.append(f"runs: {preview(command, 90)}")
         if ">" not in command and "|" not in command and "MAILTO" not in text:
             lines.append("output is mailed to the crontab owner unless redirected (>> /var/log/x.log 2>&1)")
-    if seconds_field:
-        lines.append(f"6 fields: leading seconds field {seconds_field!r} (Quartz/Spring style, not Unix cron)")
+    if seconds_field is not None:
+        lines.append(f"6 fields: leading seconds field {seconds_field.text!r} (Quartz/Spring style, not Unix cron)")
     if not (dom.star or dow.star):
         lines.append("day-of-month AND weekday both restricted: Unix cron fires when EITHER matches")
     if upcoming:
         for d in upcoming:
-            lines.append(f"next: {fmt(d, seconds=False)}  ({relative(d, ctx.now)})")
+            lines.append(f"next: {fmt(d, seconds=seconds_field is not None)}  ({relative(d, ctx.now)})")
     else:
         lines.append("no run found in the next 5 years (impossible date like Feb 30?)")
     lines.extend(notes)
     if len(ctx.zones) > 1 and upcoming:
         other = ctx.zones[1]
-        lines.append(f"first run in {zone_key(other)}: {fmt(upcoming[0], other, seconds=False)}")
+        lines.append(f"first run in {zone_key(other)}: {fmt(upcoming[0], other, seconds=seconds_field is not None)}")
     lines.append(f"evaluated in {zone_key(ctx.zone)}; cron uses the daemon's local zone (TZ= or CRON_TZ= can override)")
-    systemd = cron_to_systemd(*fields)
+    systemd = cron_to_systemd(*fields, seconds=seconds_field)
     if systemd:
         lines.append(f"systemd OnCalendar={systemd}")
         receipt = f"systemd-analyze calendar {q(systemd)}"
     else:
         receipt = None
-    data = {"english": english, "next": [iso(d) for d in upcoming], "systemd": systemd}
-    conf = 0.97 if alias or seconds_field is None and any(c in text for c in "*/,-") or len(set(parts)) > 2 else 0.6
+    data = {"english": english, "next": [iso(d) for d in upcoming], "systemd": systemd,
+            "seconds": seconds_field.text if seconds_field else None}
+    conf = 0.97 if alias or (seconds_field is None and any(c in text for c in "*/,-")) or len(set(parts)) > 2 else 0.6
     if len(set(parts)) == 1 and parts[0].isdigit():
         conf = 0.4   # "1 1 1 1 1" is probably not a schedule
     if command and conf < 0.97:
         conf = 0.85  # five schedule-ish fields followed by a command: that is a crontab line
     summary = english[0].upper() + english[1:]
     if upcoming:
-        summary += f"; next {upcoming[0].strftime('%a %H:%M')}"
+        summary += f"; next {upcoming[0].strftime('%a %H:%M:%S' if seconds_field else '%a %H:%M')}"
     if command:
         summary += f"  ->  {preview(command, 40)}"
     return [Reading("cron", conf, summary, lines, receipt, data=data)]
@@ -1291,8 +1317,7 @@ def detect_base64(s: str, ctx: Context):
     if re.fullmatch(r"[0-9a-fA-F]+", compact) and len(compact) % 2 == 0:
         conf -= 0.15  # looks more like hex
     conf = max(0.05, min(0.97, conf))
-    flags = " -d" if url_safe is False else " -d"
-    decode_cmd = f"base64{flags}" if not url_safe else "tr '_-' '/+' | base64 -d"
+    decode_cmd = "base64 -d" if not url_safe else "tr '_-' '/+' | base64 -d"
     pad_note = "" if compact.endswith("=") or len(compact) % 4 == 0 else "   # (coreutils base64 wants padding; add = until the length is a multiple of 4)"
     receipt = f"{printf_literal(compact)} | {decode_cmd}" + (" | xxd" if text is None else "") + pad_note
     label = "base64url" if url_safe else "base64"
@@ -1825,8 +1850,11 @@ def int_facts(n: int) -> list[str]:
 
 
 def num_words(n: int) -> str:
-    """Rough magnitude: 1.7 billion."""
-    for value, word in ((10**12, "trillion"), (10**9, "billion"), (10**6, "million"), (10**3, "thousand")):
+    """Rough magnitude: 1.7 billion, 18.4 quintillion."""
+    if abs(n) >= 10**21:
+        return f"{n:.3g}"
+    for value, word in ((10**18, "quintillion"), (10**15, "quadrillion"), (10**12, "trillion"),
+                        (10**9, "billion"), (10**6, "million"), (10**3, "thousand")):
         if abs(n) >= value:
             return f"{n / value:.3g} {word}"
     return str(n)
@@ -1888,10 +1916,19 @@ def detect_number(s: str, ctx: Context):
         f64 = struct.unpack(">d", (n & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "big"))[0]
         if math.isfinite(f64):
             lines.append(f"as IEEE-754 float64 (big-endian): {f64:.15g}")
-    receipt = f"printf '%d 0x%x 0o%o\\n' {q(raw if base != 2 else str(n))} {q(raw if base != 2 else str(n))} {q(raw if base != 2 else str(n))}" if base != 2 \
-        else f"echo $(( 2#{body} ))"
-    if base == 10 and "," in s:
+    shell_range = -2**63 <= n <= 2**63 - 1
+    if not shell_range:
+        # Shell arithmetic and printf are 64-bit; use Python for bigger integers.
+        py_value = f"int({q(body)}, {base})"
+        if sign < 0:
+            py_value = "-" + py_value
+        receipt = f"python3 -c 'print({py_value})'"
+    elif base == 2:
+        receipt = f"echo $(( {'-2#' if sign < 0 else '2#'}{body} ))"
+    elif base == 10 and "," in s:
         receipt = f"printf '0x%x 0o%o\\n' {n} {n}"
+    else:
+        receipt = f"printf '%d 0x%x 0o%o\\n' {n} {n} {n}"
     label = {16: "hex", 2: "binary", 8: "octal", 10: "integer"}[base]
     summary = f"{label} {commas(n)}" if base != 10 else f"integer {commas(n)}" + (f", {num_words(n)}" if abs(n) >= 10**4 else "")
     if base == 10 and abs(n) < 10**4:
@@ -1974,7 +2011,8 @@ def detect_arithmetic(s: str, ctx: Context):
             lines.append(f"^ read as power; as XOR (C, Python, shells) it would be {xor}")
         except (ValueError, SyntaxError, TypeError, ZeroDivisionError, OverflowError):
             lines.append("^ read as power (in C, Python and shells ^ means XOR)")
-    shell_safe = isinstance(value, int) and not caret_as_power and "**" not in expr and "/" not in expr and "0b" not in expr.lower() and "0o" not in expr.lower()
+    shell_safe = isinstance(value, int) and -2**63 <= value <= 2**63 - 1 and not caret_as_power \
+        and "**" not in expr and "/" not in expr and "0b" not in expr.lower() and "0o" not in expr.lower()
     receipt = f"echo $(( {expr} ))" if shell_safe else f"python3 -c 'print({expr.replace('^', '**') if caret_as_power else expr})'"
     shown = f"{commas(value)}" if isinstance(value, int) else f"{value:.12g}"
     conf = 0.9 if re.search(r"[\da-fA-F]\s*[+\-*/%&|^<>]+\s*[\d(]", expr) or "(" in expr else 0.6
@@ -2432,13 +2470,25 @@ def detect_color(s: str, ctx: Context):
         how = "hex"
     m = re.fullmatch(r"rgba?\(\s*(\d{1,3})\s*[, ]\s*(\d{1,3})\s*[, ]\s*(\d{1,3})\s*(?:[,/]\s*([\d.]+%?)\s*)?\)", text)
     if m:
-        rgb = tuple(min(255, int(v)) for v in m.groups()[:3])
+        channels = [int(v) for v in m.groups()[:3]]
+        if any(v > 255 for v in channels):
+            return None
+        rgb = tuple(channels)
         if m.group(4):
             alpha = float(m.group(4).rstrip("%")) / (100 if m.group(4).endswith("%") else 1)
+            if not 0 <= alpha <= 1:
+                return None
         how = "rgb()"
     m = re.fullmatch(r"hsla?\(\s*([\d.]+)(?:deg)?\s*[, ]\s*([\d.]+)%\s*[, ]\s*([\d.]+)%\s*(?:[,/]\s*([\d.]+%?)\s*)?\)", text)
     if m:
-        hh, ss_, ll = float(m.group(1)) % 360 / 360, float(m.group(2)) / 100, float(m.group(3)) / 100
+        sat, light = float(m.group(2)), float(m.group(3))
+        if not 0 <= sat <= 100 or not 0 <= light <= 100:
+            return None
+        if m.group(4):
+            alpha = float(m.group(4).rstrip("%")) / (100 if m.group(4).endswith("%") else 1)
+            if not 0 <= alpha <= 1:
+                return None
+        hh, ss_, ll = float(m.group(1)) % 360 / 360, sat / 100, light / 100
         r, g, b = colorsys.hls_to_rgb(hh, ll, ss_)
         rgb = (round(r * 255), round(g * 255), round(b * 255))
         how = "hsl()"
@@ -2636,9 +2686,12 @@ def special_range(addr) -> str | None:
 def detect_ip(s: str, ctx: Context):
     text = s
     port = None
+    bad_port = None
     m = re.fullmatch(r"\[([0-9a-fA-F:.]+)\]:(\d{1,5})", text) or re.fullmatch(r"(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})", text)
     if m:
         text, port = m.group(1), int(m.group(2))
+        if not 1 <= port <= 65535:
+            bad_port, port = port, None
     if "/" in text:
         return None
     try:
@@ -2674,6 +2727,8 @@ def detect_ip(s: str, ctx: Context):
     if port:
         svc = WELL_KNOWN_PORTS.get(port)
         lines.append(f"port {port}" + (f": {svc}" if svc else ""))
+    elif bad_port is not None:
+        lines.append(f"port {bad_port} is out of range (valid ports are 1-65535)")
     conf = 0.95 if addr.version == 4 and text.count(".") == 3 or addr.version == 6 and ":" in text else 0.6
     receipt = f"python3 -c 'import ipaddress,sys; a=ipaddress.ip_address(sys.argv[1]); print(a.exploded, a.is_private, a.is_global, a.reverse_pointer)' {q(text)}"
     if have("ipcalc") and addr.version == 4:
@@ -2805,8 +2860,6 @@ def detect_hash(s: str, ctx: Context):
     name, tool = HASH_LENGTHS[len(text)]
     bits = len(text) * 4
     lines = [f"{len(text)} hex digits = {bits} bits = {bits // 8} bytes: {name}"]
-    if len(text) in (7, 8, 12, 40, 64) or 7 <= len(text) <= 40:
-        pass
     if len(text) == 40:
         lines.append("if from git: a full commit/tree/blob id - try git cat-file -t ID in the repository")
     if len(text) == 32:
@@ -2882,11 +2935,17 @@ def git_lookup(oid: str) -> tuple[str, str] | None:
     """(type, one-line description) for an object in the current repository, read-only."""
     if not have("git") or not re.fullmatch(r"[0-9a-f]{4,64}", oid):
         return None
-    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1", LC_ALL="C")
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1",
+               GIT_CONFIG_GLOBAL=os.devnull, LC_ALL="C", LANG="C")
+    deadline = time.monotonic() + GIT_TIMEOUT
 
     def run(*args):
-        return subprocess.run(["git", "--no-pager", "-c", "core.hooksPath=/dev/null", *args], capture_output=True, text=True,
-                              timeout=GIT_TIMEOUT, env=env, stdin=subprocess.DEVNULL)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(args, GIT_TIMEOUT)
+        return subprocess.run(["git", "--no-pager", "-c", "core.hooksPath=/dev/null", *args], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", timeout=remaining, env=env,
+                              stdin=subprocess.DEVNULL)
     try:
         if run("rev-parse", "--is-inside-work-tree").stdout.strip() != "true" and run("rev-parse", "--is-bare-repository").stdout.strip() != "true":
             return None
@@ -3351,7 +3410,7 @@ def detect_card_number(s: str, ctx: Context):
 
 @detector
 def detect_coordinates(s: str, ctx: Context):
-    m = re.fullmatch(r"([+-]?\d{1,2}(?:\.\d+)?)\s*°?\s*([NS])?\s*,?\s+([+-]?\d{1,3}(?:\.\d+)?)\s*°?\s*([EW])?", s)
+    m = re.fullmatch(r"([+-]?\d{1,2}(?:\.\d+)?)\s*°?\s*([NSns])?\s*,?\s+([+-]?\d{1,3}(?:\.\d+)?)\s*°?\s*([EWew])?", s)
     if not m:
         m = re.fullmatch(r"([+-]?\d{1,2}\.\d+),\s*([+-]?\d{1,3}\.\d+)", s)
         if not m:
@@ -3359,9 +3418,9 @@ def detect_coordinates(s: str, ctx: Context):
         lat, lon = float(m.group(1)), float(m.group(2))
     else:
         lat, lon = float(m.group(1)), float(m.group(3))
-        if m.group(2) == "S":
+        if (m.group(2) or "").upper() == "S":
             lat = -abs(lat)
-        if m.group(4) == "W":
+        if (m.group(4) or "").upper() == "W":
             lon = -abs(lon)
     if not (-90 <= lat <= 90 and -180 <= lon <= 180) or (lat == int(lat) and lon == int(lon)):
         return None
@@ -3409,12 +3468,16 @@ def read_clipboard() -> str:
     commands = (["wl-paste", "--no-newline"], ["xclip", "-selection", "clipboard", "-o"], ["xsel", "--clipboard", "--output"],
                 ["pbpaste"], ["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard"], ["termux-clipboard-get"])
     tried = []
+    deadline = time.monotonic() + CLIP_TIMEOUT
     for cmd in commands:
         if not have(cmd[0]):
             continue
         tried.append(cmd[0])
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            p = subprocess.run(cmd, capture_output=True, timeout=CLIP_TIMEOUT, stdin=subprocess.DEVNULL)
+            p = subprocess.run(cmd, capture_output=True, timeout=remaining, stdin=subprocess.DEVNULL)
         except (OSError, subprocess.SubprocessError):
             continue
         if p.returncode != 0:
@@ -3450,24 +3513,29 @@ def dedupe(readings: list[Reading]) -> list[Reading]:
     return out
 
 
-def render(readings: list[Reading], total: int, verbose: bool, width: int) -> str:
+def render(readings: list[Reading], total: int, width: int) -> str:
     lines_out: list[str] = []
     if not readings:
         return "huh: no idea. Nothing matched - try --all, or check the input for stray quotes/spaces."
+
+    def fit(text: str, limit: int) -> str:
+        # Receipts are deliberately excluded: they must stay copy-pasteable.
+        return text if limit < 60 or len(text) <= limit else text[:limit - 3] + "..."
+
     for i, r in enumerate(readings):
         tag = f"{r.kind}" if r.confidence >= 0.75 else f"{r.kind}?" if r.confidence >= 0.4 else f"{r.kind}??"
         head = f"{tag:<16} {clean(r.summary)}"
-        lines_out.append(head if len(head) <= width or width < 60 else head[: width - 3] + "...")
+        lines_out.append(fit(head, width))
         for ln in r.lines:
-            lines_out.append(f"{'':16} {clean(ln)}")
+            lines_out.append(fit(f"{'':16} {clean(ln)}", width))
         for child in r.children:
             where = f"{clean(child.via)} = " if child.via else ""
-            lines_out.append(f"{'':16}   -> {where}{child.kind}: {clean(child.summary)}")
+            lines_out.append(fit(f"{'':16}   -> {where}{child.kind}: {clean(child.summary)}", width))
             for ln in child.lines[:3]:
-                lines_out.append(f"{'':16}      {clean(ln)}")
+                lines_out.append(fit(f"{'':16}      {clean(ln)}", width))
             for grandchild in child.children[:3]:
                 where = f"{clean(grandchild.via)} = " if grandchild.via else ""
-                lines_out.append(f"{'':16}      -> {where}{grandchild.kind}: {clean(grandchild.summary)}")
+                lines_out.append(fit(f"{'':16}      -> {where}{grandchild.kind}: {clean(grandchild.summary)}", width))
         if r.receipt:
             lines_out.append(f"{'':16} $ {clean(r.receipt)}")
         if i != len(readings) - 1:
@@ -3532,40 +3600,80 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+KIND_OVERRIDES = {
+    "epoch": [k for k, _, _ in EPOCH_UNITS],
+    "passwd_line": ["passwd", "group", "shadow"],
+    "binary_blob": ["binary"],
+    "time_of_day": ["time"],
+    "url_encoded": ["url-encoded"],
+    "mojibake": ["unicode"],  # mojibake readings are unicode readings
+}
+
+KIND_ALIASES = {"mojibake": "unicode", "url encoded": "url-encoded", "url_encoded": "url-encoded",
+                "time of day": "time", "binary blob": "binary"}
+
+
+def normalize_kind(kind: str) -> str:
+    return kind.strip().lower().replace("_", "-").replace(" ", "-")
+
+
 def all_kinds() -> list[str]:
-    """Kinds, in detector order, discovered from the source so --list cannot go stale."""
+    """Kinds, in detector order, with explicit overrides for detectors whose names differ from their readings."""
     kinds: list[str] = []
     for fn in DETECTORS:
-        name = fn.__name__.removeprefix("detect_").replace("_", " ")
-        if name == "epoch":
-            kinds.extend(k for k, _, _ in EPOCH_UNITS)
-        elif name == "passwd line":
-            kinds.extend(["passwd", "group", "shadow"])
-        elif name == "binary blob":
-            kinds.append("binary")
-        elif name == "time of day":
-            kinds.append("time")
-        else:
-            kinds.append(name)
+        name = fn.__name__.removeprefix("detect_")
+        for kind in KIND_OVERRIDES.get(name, [name.replace("_", " ")]):
+            if kind not in kinds:
+                kinds.append(kind)
     return kinds
+
+
+_CLI_FLAGS = {"-a", "--all", "-j", "--json", "--list", "-V", "--version", "-h", "--help", "--"}
+_CLI_VALUE_OPTIONS = {"-t", "--type", "--tz", "--now", "-n", "--max"}
+_CLI_LONG_VALUE_PREFIXES = ("--type=", "--tz=", "--now=", "--max=")
+_MODE_RE = re.compile(r"^[-dlbcpsD][rwxstST-]{9}[.+@]?$")
+_NEGATIVE_RE = re.compile(r"^-\d+(?:\.\d+)?$")
+_CHMOD_SYMBOLIC_RE = re.compile(r"^[ugoa]*[+=-][rwxXstugo]+(?:,[ugoa]*[+=-][rwxXstugo]+)*$")
+
+
+def _looks_like_dash_input(token: str) -> bool:
+    """True for the leading-dash strings huh explains: modes, negative numbers, symbolic chmod."""
+    return bool(_MODE_RE.match(token) or _NEGATIVE_RE.match(token) or _CHMOD_SYMBOLIC_RE.match(token))
+
+
+def _prepare_cli_args(raw_args: list[str]) -> list[str]:
+    """Protect leading-dash *input* with a sentinel, leaving real unknown options for argparse to reject.
+
+    Earlier versions inserted '--' before anything that looked unusual, so '--jsn' quietly became input.
+    """
+    prepared: list[str] = []
+    after_double_dash = False
+    for i, token in enumerate(raw_args):
+        if after_double_dash:
+            prepared.append(token)
+            continue
+        if token == "--":
+            after_double_dash = True
+            prepared.append(token)
+            continue
+        previous_takes_value = i > 0 and raw_args[i - 1] in _CLI_VALUE_OPTIONS
+        known = token in _CLI_FLAGS or token in _CLI_VALUE_OPTIONS or token.startswith(_CLI_LONG_VALUE_PREFIXES)
+        prepared.append("\x00" + token if not known and not previous_takes_value and _looks_like_dash_input(token) else token)
+    return prepared
 
 
 def main(argv: list[str] | None = None) -> int:
     raw_args = list(sys.argv[1:] if argv is None else argv)
-    # "huh -rwxr-xr-x" and "huh -1": things that start with '-' but are input, not options.
-    fixed: list[str] = []
-    for i, a in enumerate(raw_args):
-        if a.startswith("-") and a not in ("-a", "--all", "-j", "--json", "-t", "--type", "--tz", "--now", "--list", "-n", "--max", "-V", "--version", "-h", "--help", "--") \
-                and not a.startswith(("--tz=", "--type=", "--now=", "--max=")) and (i == 0 or raw_args[i - 1] not in ("-t", "--type", "--tz", "--now", "-n", "--max")) \
-                and "--" not in fixed:
-            fixed.append("--")
-        fixed.append(a)
     parser = build_parser()
-    args = parser.parse_args(fixed)
+    args = parser.parse_args(_prepare_cli_args(raw_args))
+    if args.text:
+        args.text = [t[1:] if t.startswith("\x00") else t for t in args.text]
     if args.list:
         for k in all_kinds():
             print(k)
         return 0
+    if args.max < 1:
+        parser.error("--max must be at least 1")
     try:
         zones = parse_zones(args.tz)
     except ValueError as e:
@@ -3597,8 +3705,9 @@ def main(argv: list[str] | None = None) -> int:
     ctx = Context(now=now, zones=zones)
     readings = dedupe(decode(text, ctx))
     if args.type:
-        wanted = {k.strip().lower() for k in args.type.split(",")}
-        readings = [r for r in readings if r.kind in wanted or r.kind.replace(" ", "-") in wanted or r.kind.split()[0] in wanted]
+        wanted = {normalize_kind(KIND_ALIASES.get(k.strip().lower(), k)) for k in args.type.split(",") if k.strip()}
+        readings = [r for r in readings
+                    if normalize_kind(r.kind) in wanted or normalize_kind(r.kind).split("-")[0] in wanted]
     total = len(readings)
     if args.all:
         shown = readings
@@ -3615,7 +3724,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, indent=2, ensure_ascii=True, default=str))
         return 0 if readings else 1
     width = shutil.get_terminal_size((100, 24)).columns if sys.stdout.isatty() else 10_000
-    print(render(shown, total, args.all, width))
+    print(render(shown, total, width))
     return 0 if readings else 1
 
 

@@ -74,6 +74,9 @@ class SchemaTests(unittest.TestCase):
         self.assertIn("epoch seconds", names)
         self.assertIn("cron", names)
         self.assertIn("shadow", names)
+        self.assertIn("url-encoded", names)
+        self.assertIn("unicode", names)
+        self.assertNotIn("mojibake", names)
         self.assertEqual(len(names), len(set(names)))
 
 
@@ -276,6 +279,16 @@ class CronTests(unittest.TestCase):
         r = find("0 0 * * * *", "cron")
         self.assertIn("seconds field", joined(r))
 
+    def test_six_field_seconds_are_used(self):
+        r = find("30 0 * * * *", "cron")
+        self.assertEqual(r.data["next"][0], "2026-10-06T14:00:30Z")
+        self.assertEqual(r.data["systemd"], "*-*-* *:00:30")
+
+    def test_one_word_command(self):
+        r = find("0 2 * * * backup", "cron")
+        self.assertIn("backup", r.summary)
+        self.assertEqual(r.data["next"][0], "2026-10-07T02:00:00Z")
+
     def test_crontab_line_with_command(self):
         r = find("0 2 * * * /usr/local/bin/backup.sh >> /var/log/backup.log 2>&1", "cron")
         self.assertIn("backup.sh", joined(r))
@@ -300,6 +313,7 @@ class TimezoneTests(unittest.TestCase):
     def test_city(self):
         self.assertEqual(find("tokyo", "timezone").data["zone"], "Asia/Tokyo")
         self.assertEqual(find("new york", "timezone").data["zone"], "America/New_York")
+        self.assertEqual(find("asia/tokyo", "timezone").data["zone"], "Asia/Tokyo")
 
     def test_offset(self):
         self.assertEqual(find("+05:30", "timezone").data["offset"], "UTC+05:30")
@@ -500,6 +514,14 @@ class NumberTests(unittest.TestCase):
         self.assertIn("1.465 MiB", joined(r))
         self.assertIn("17d 18h 40m", joined(r))
 
+    def test_big_numbers_use_python_receipts(self):
+        r = find("18446744073709551615", "number")
+        self.assertIn("quintillion", joined(r))
+        self.assertTrue(r.receipt.startswith("python3 -c"))
+        self.assertIn("18446744073709551615", r.receipt)
+        r = find("2**100", "arithmetic")
+        self.assertTrue(r.receipt.startswith("python3 -c"))
+
     def test_arithmetic(self):
         self.assertIn("= 265", best("0xff + 0b1010").summary)
         self.assertIn("4,294,967,295", best("2**32-1").summary)
@@ -601,6 +623,8 @@ class SystemCodeTests(unittest.TestCase):
         self.assertEqual(best("hsl(120,100%,50%)").data["hex"], "#00ff00")
         self.assertEqual(best("rebeccapurple").data["hex"], "#663399")
         self.assertIn("WCAG", joined(r))
+        for text in ["rgb(300,0,0)", "hsl(120,150%,50%)", "rgba(0,0,0,2)", "hsla(0,100%,50%,150%)"]:
+            self.assertNotIn("color", kinds(text), text)
 
 
 class IdentifierTests(unittest.TestCase):
@@ -638,6 +662,9 @@ class IdentifierTests(unittest.TestCase):
         self.assertIn("public", best("8.8.8.8").summary)
         self.assertIn("Cloudflare", best("1.1.1.1").summary)
         self.assertEqual(readings("256.1.1.1"), [])
+        bad = find("10.0.0.1:99999", "ip")
+        self.assertNotIn(":99999", bad.summary)
+        self.assertIn("out of range", joined(bad))
 
     def test_cidr(self):
         r = best("10.0.0.0/22")
@@ -734,7 +761,8 @@ class IdentifierTests(unittest.TestCase):
         for args, kwargs in calls:
             self.assertEqual(args[0], "git")
             self.assertNotIn("shell", kwargs)
-            self.assertEqual(kwargs["timeout"], huh.GIT_TIMEOUT)
+            self.assertGreater(kwargs["timeout"], 0)
+            self.assertLessEqual(kwargs["timeout"], huh.GIT_TIMEOUT)
             self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
             self.assertIn("core.hooksPath=/dev/null", args)
             self.assertFalse(any(a in ("push", "fetch", "pull", "commit", "checkout", "reset") for a in args))
@@ -789,6 +817,7 @@ class FileTests(unittest.TestCase):
         self.assertEqual(r.kind, "coordinates")
         self.assertIn("27.95060, -82.45720", r.summary)
         self.assertIn("openstreetmap", joined(r))
+        self.assertIn("-82.45720", best("27.9506 n, 82.4572 w").summary)
         self.assertEqual(readings("0, 0"), [])
 
     def test_binary_blob(self):
@@ -807,7 +836,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_rendered_output_has_no_raw_escapes(self):
         for text in ["\x1b[31mred\x1b[0m", "a\u200bb", "\u202eevil", "\x07bell", "\x1b]0;title\x07"]:
-            out = huh.render(readings(text), 1, False, 100)
+            out = huh.render(readings(text), 1, 100)
             for ch in out:
                 self.assertFalse(ord(ch) < 32 and ch not in "\n\t", f"control char {ord(ch):#x} in output for {text!r}")
             self.assertNotIn("\u200b", out)
@@ -856,7 +885,8 @@ class SafetyTests(unittest.TestCase):
         ok = subprocess.CompletedProcess([], 0, b"1696500000", b"")
         with mock.patch.object(huh, "have", return_value=True), mock.patch.object(huh.subprocess, "run", return_value=ok) as run:
             self.assertEqual(huh.read_clipboard(), "1696500000")
-            self.assertEqual(run.call_args.kwargs["timeout"], huh.CLIP_TIMEOUT)
+            self.assertGreater(run.call_args.kwargs["timeout"], 0)
+            self.assertLessEqual(run.call_args.kwargs["timeout"], huh.CLIP_TIMEOUT)
             self.assertNotIn("shell", run.call_args.kwargs)
 
 
@@ -908,6 +938,20 @@ class CLITests(unittest.TestCase):
         self.assertIn("chmod 755", p.stdout)
         self.assertEqual(self.run_cli("-1").returncode, 0)
         self.assertEqual(self.run_cli("-9").returncode, 0)
+        p = self.run_cli("-rwxr-xr-x", "-n", "1")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("chmod 755", p.stdout)
+
+    def test_unknown_options_fail_instead_of_becoming_input(self):
+        p = self.run_cli("--jsn", "137")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("unrecognized arguments: --jsn", p.stderr)
+        self.assertEqual(self.run_cli("-z").returncode, 2)
+
+    def test_double_dash_passes_odd_text(self):
+        p = self.run_cli("--", "-z")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("no idea", p.stdout)
 
     def test_multiword_without_quotes(self):
         p = self.run_cli("0", "*/4", "*", "*", "1-5")
@@ -948,6 +992,18 @@ class CLITests(unittest.TestCase):
         self.assertEqual(len(one), 1)
         only = json.loads(self.run_cli("--json", "--type", "chmod", "137").stdout)["readings"]
         self.assertEqual([r["kind"] for r in only], ["chmod"])
+        p = self.run_cli("--max", "0", "137")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("--max must be at least 1", p.stderr)
+
+    def test_type_normalization_and_aliases(self):
+        data = json.loads(self.run_cli("--json", "--type", "url encoded", "hello%20world").stdout)
+        self.assertEqual([r["kind"] for r in data["readings"]], ["url-encoded"])
+        data = json.loads(self.run_cli("--json", "--type", "mojibake", "caf\u00c3\u00a9").stdout)
+        self.assertEqual([r["kind"] for r in data["readings"]], ["unicode"])
+        data = json.loads(self.run_cli("--json", "--type", "epoch", "1696500000").stdout)
+        self.assertTrue(data["readings"])
+        self.assertTrue(all(r["kind"].startswith("epoch ") for r in data["readings"]))
 
     def test_tz(self):
         p = self.run_cli("--tz", "America/New_York,Asia/Tokyo", "1696500000")
