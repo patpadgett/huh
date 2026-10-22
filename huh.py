@@ -25,6 +25,7 @@ import colorsys
 import datetime as dt
 import email.utils
 import errno as errno_mod
+import functools
 import html
 import http
 import ipaddress
@@ -211,7 +212,9 @@ def hexdump(data: bytes, n: int = 16) -> str:
     return " ".join(f"{b:02x}" for b in data[:n]) + (" ..." if len(data) > n else "")
 
 
+@functools.cache
 def have(tool: str) -> bool:
+    """Is *tool* on PATH? Cached: PATH does not change during a run, and shutil.which is not cheap."""
     return shutil.which(tool) is not None
 
 
@@ -769,6 +772,8 @@ DURATION_UNITS = {
 
 def parse_duration(s: str) -> tuple[float, str] | None:
     """Seconds for '1h 30m', '90min', '1.5h', 'PT1H30M', '01:30:00', '2d4h'; plus how it was read."""
+    if len(s) > 256:
+        return None  # durations are short; this also keeps hostile input linear
     m = re.fullmatch(r"(?i)P(?:(\d+(?:\.\d+)?)Y)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)W)?(?:(\d+(?:\.\d+)?)D)?"
                      r"(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?", s)
     if m and any(m.groups()) and s.upper() != "P":
@@ -781,16 +786,35 @@ def parse_duration(s: str) -> tuple[float, str] | None:
         h, mi, sec, frac = m.groups()
         total = int(h) * 3600 + int(mi) * 60 + int(sec) + (float("0." + frac) if frac else 0)
         return total, "H:MM:SS"
-    tokens = re.findall(r"(\d+(?:\.\d+)?)\s*([a-zA-Zµμ]+)", s)
-    if tokens and re.fullmatch(r"(?:\s*\d+(?:\.\d+)?\s*[a-zA-Zµμ]+\s*,?(?:\s+and\s+)?)+", s):
-        total = 0.0
-        for number, unit in tokens:
-            u = unit.lower().rstrip("s") if unit.lower() not in ("s", "ms", "us", "ns") else unit.lower()
-            if u not in DURATION_UNITS:
-                return None
-            total += float(number) * DURATION_UNITS[u]
-        return total, "units"
-    return None
+    # Linear tokenizer instead of a nested-quantifier regex. Accepts "1h 30m",
+    # "1h30m", "1h, 30m", and "1h and 30m"; rejects anything else.
+    token_re = re.compile(r"\s*(\d+(?:\.\d+)?)\s*([a-zA-Zµμ]+)")
+    sep_re = re.compile(r"\s*(?:,\s*)?(?:and\s+)?", re.I)
+    total = 0.0
+    pos = 0
+    found = False
+    while pos < len(s):
+        m = token_re.match(s, pos)
+        if not m:
+            return None
+        number, unit = m.groups()
+        u = unit.lower()
+        if u not in ("s", "ms", "us", "ns", "µs", "μs"):
+            u = u.rstrip("s")
+        if u not in DURATION_UNITS:
+            return None
+        total += float(number) * DURATION_UNITS[u]
+        found = True
+        pos = m.end()
+        if pos >= len(s):
+            break
+        if s[pos].isdigit():
+            continue  # "1h30m"
+        sep = sep_re.match(s, pos)
+        if not sep or sep.end() == pos:
+            return None
+        pos = sep.end()
+    return (total, "units") if found else None
 
 
 @detector
@@ -2753,8 +2777,10 @@ def detect_password_hash(s: str, ctx: Context):
     lines = [f"modular crypt format: ${tag}$ = {names[tag]}"]
     if tag.startswith("2"):
         cost = rest[0] if rest and rest[0].isdigit() else rest[0][:2] if rest else ""
-        if cost.isdigit():
+        if cost.isdigit() and len(cost) <= 2 and 4 <= int(cost) <= 31:
             lines.append(f"cost {cost}: 2^{cost} = {commas(2 ** int(cost))} rounds; 10-12 is typical today")
+        elif cost:
+            lines.append(f"cost {preview(cost, 12)}: outside the valid bcrypt range 4-31")
         lines.append("bcrypt truncates passwords at 72 bytes")
     elif tag in ("5", "6") and rest and rest[0].startswith("rounds="):
         lines.append(f"{rest[0]} (default 5000)")
@@ -2765,8 +2791,8 @@ def detect_password_hash(s: str, ctx: Context):
     elif tag == "y" and rest:
         lines.append(f"yescrypt parameters {rest[0]}")
     lines.append("one-way: verify with the same algorithm; to crack you need hashcat/john and a wordlist")
-    return [Reading("password hash", 0.95, f"password hash: {names[tag]}", [ln for ln in lines if ln],
-                    f"python3 -c 'import crypt,sys; print(crypt.crypt(\"password\", sys.argv[1]))' {q(s)}   # compares (Python < 3.13)" if tag in ("1", "5", "6", "y") else None)]
+    # No receipt: the hash itself is sensitive, and Python's crypt module was removed in 3.13.
+    return [Reading("password hash", 0.95, f"password hash: {names[tag]}", [ln for ln in lines if ln], None)]
 
 
 @detector
@@ -2842,7 +2868,7 @@ def detect_ssh_key(s: str, ctx: Context):
             return None
         import hashlib
         fp = base64.b64encode(hashlib.sha256(raw).digest()).decode().rstrip("=")
-        md5 = ":".join(f"{b:02x}" for b in hashlib.md5(raw).digest())
+        md5 = ":".join(f"{b:02x}" for b in hashlib.md5(raw, usedforsecurity=False).digest())
         bits = ""
         if algo == "ssh-rsa" and len(raw) > 20:
             # string "ssh-rsa", mpint e, mpint n
@@ -2872,13 +2898,27 @@ def detect_ssh_key(s: str, ctx: Context):
     return None
 
 
+_BEGIN_PEM = re.compile(r"-----BEGIN ([A-Z0-9 ]{1,64})-----")
+
+
 @detector
 def detect_pem(s: str, ctx: Context):
-    m = re.search(r"-----BEGIN ([A-Z0-9 ]+)-----(.*?)-----END \1-----", s, re.S)
-    if not m:
+    block = None
+    for i, m in enumerate(_BEGIN_PEM.finditer(s)):
+        if i >= 8:
+            break  # a handful of candidates is plenty; keeps hostile input linear
+        label = m.group(1)
+        end = s.find(f"-----END {label}-----", m.end())
+        if end >= 0:
+            block = label, s[m.end():end]
+            break
+    if block is None:
         return None
-    label, body = m.group(1), re.sub(r"\s+", "", m.group(2))
-    body = re.sub(r"^(?:Proc-Type|DEK-Info):.*$", "", body, flags=re.M)
+    label, body_text = block
+    encrypted = "ENCRYPTED" in label or "Proc-Type:" in body_text
+    # MIME headers (Proc-Type/DEK-Info) are not base64; drop them before whitespace collapse.
+    body = re.sub(r"\s+", "", "\n".join(
+        line for line in body_text.splitlines() if not line.startswith(("Proc-Type:", "DEK-Info:"))))
     try:
         raw = base64.b64decode(body, validate=False)
     except (binascii.Error, ValueError):
@@ -2887,7 +2927,7 @@ def detect_pem(s: str, ctx: Context):
     lines = [f"PEM block: {label}, {plural(len(raw), 'byte')} of DER inside"]
     if private:
         lines.append("THIS IS A PRIVATE KEY - do not paste it anywhere, including here; rotate it if it has been shared")
-        if "ENCRYPTED" in label or "Proc-Type" in s:
+        if encrypted:
             lines.append("encrypted with a passphrase")
     if label == "CERTIFICATE":
         lines.append("X.509 certificate; details: openssl x509 -noout -text -in FILE")

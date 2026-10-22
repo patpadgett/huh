@@ -11,6 +11,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -789,6 +790,35 @@ class SafetyTests(unittest.TestCase):
             self.assertEqual(huh.read_clipboard(), "1696500000")
             self.assertEqual(run.call_args.kwargs["timeout"], huh.CLIP_TIMEOUT)
             self.assertNotIn("shell", run.call_args.kwargs)
+
+
+class HostileInputTests(unittest.TestCase):
+    def assert_fast(self, fn, *args, limit=1.0):
+        start = time.perf_counter()
+        result = fn(*args)
+        elapsed = time.perf_counter() - start
+        self.assertLess(elapsed, limit, f"took {elapsed:.3f}s")
+        return result
+
+    def test_duration_rejects_64k_digits_quickly(self):
+        self.assertIsNone(self.assert_fast(huh.parse_duration, "1" * huh.MAX_INPUT))
+        self.assertIsNone(self.assert_fast(huh.parse_duration, ("1h " * 20000)))
+
+    def test_pem_regex_is_linear(self):
+        self.assertIsNone(self.assert_fast(
+            huh.detect_pem, "-----BEGIN A-----" * 4000, ctx()))
+
+    def test_bcrypt_cost_is_bounded(self):
+        r = self.assert_fast(huh.detect_password_hash, "$2b$999999999$abcdefghijklmnopqrstuv", ctx())
+        self.assertTrue(r)
+        self.assertIn("outside the valid bcrypt range", joined(r[0]))
+        self.assert_fast(huh.detect_password_hash, "$2b$" + "9" * 5000 + "$x", ctx())
+
+    def test_have_is_cached(self):
+        huh.have("sh")
+        before = huh.have.cache_info().hits
+        huh.have("sh")
+        self.assertGreater(huh.have.cache_info().hits, before)
 
 
 class CLITests(unittest.TestCase):
