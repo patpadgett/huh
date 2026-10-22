@@ -196,7 +196,7 @@ date             Sun 2024-03-10 02:30:00 EST (zone assumed), 2 years 6 months ag
                  2024-03-10 02:30 does not exist in America/New_York: clocks jumped forward over it (DST gap); the next real instant is Sun 2024-03-10 03:30:00 EDT
                  if UTC: Sat 2024-03-09 21:30:00 EST
                  epoch 1710055800, 2 years 6 months ago
-                 $ TZ=America/New_York date -d '2024-03-10 02:30'; TZ=America/New_York date -d '2024-03-10 02:30' +%s
+                 $ TZ=America/New_York date -d @1710055800
 ```
 
 ### The full list
@@ -222,14 +222,16 @@ ordinary Linux/macOS box (`date`, `base64`, `xxd`, `numfmt`, `jq`,
 spells them as octal byte escapes (`\342\200\213`), the one form every
 POSIX `printf` understands, so it stays copy-pasteable in bash, zsh and dash.
 
-Secrets (API tokens, private keys, card numbers) get no receipt at all.
+Credential-bearing inputs (API tokens, URLs with passwords, secret JSON fields,
+card numbers) get no receipt. PEM private keys only get an `ssh-keygen -lf`
+fingerprint command, never the key itself.
 
 ## Safety
 
 * Nothing leaves the machine. There is no network code.
 * Nothing is written. The only subprocesses are a paste tool (bare `huh` only),
   and read-only `git cat-file`/`git log` when a hex id matches an object in the
-  current repository; both have 2-second timeouts and run without a shell.
+  current repository; both share a 2-second deadline and run without a shell.
 * Input is capped at 64 KiB; recursion at 3 levels and 48 total decodes;
   arithmetic at 200 characters, 60 AST nodes and 4096-bit results. Hostile JSON
   depth, `9**9**9`, `__import__(...)` and friends are tested to do nothing.
@@ -242,7 +244,7 @@ Secrets (API tokens, private keys, card numbers) get no receipt at all.
 ## Development
 
 ```sh
-python3 -m unittest discover -s tests -v     # 110 tests, ~3 s, no third-party packages
+python3 -m unittest discover -s tests -v     # full suite; no third-party runtime dependencies
 HUH_DEBUG=1 huh ...                           # let detector exceptions surface instead of being swallowed
 ```
 
@@ -258,7 +260,27 @@ def detect_thing(s: str, ctx: Context):
 
 `ctx` carries the reference instant (`--now`) and display zones (`--tz`);
 `nested(text, ctx)` recurses into decoded content with the shared budget.
-`--list` is generated from the registry, so it cannot go stale.
+`--list` is generated from the registry, so it cannot go stale. The version
+lives in `huh.__version__`; `pyproject.toml` reads it dynamically.
+
+## Releasing
+
+Releases use PyPI trusted publishing (OIDC), so there is no PyPI token stored
+in GitHub. The trusted publisher configured on PyPI for project `whatsthis`
+must name owner `patpadgett`, repository `huh`, workflow `publish.yml`, and
+environment `pypi`.
+
+1. Bump `__version__` in `huh.py` (the only version string).
+2. Commit and push the change to `main`.
+3. Tag the release and push the tag:
+   ```sh
+   git tag v0.1.1
+   git push origin main --tags
+   ```
+4. `.github/workflows/publish.yml` tests, builds, checks, and publishes the
+   sdist and wheel to [PyPI](https://pypi.org/project/whatsthis/).
+
+Do not push the tag until the trusted publisher above has been saved on PyPI.
 
 ## Non-goals
 

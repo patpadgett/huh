@@ -4,14 +4,31 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install linter
+        run: python -m pip install --quiet --upgrade pip ruff
+      - name: Lint for syntax errors and undefined names
+        run: ruff check --select E9,F .
+
   test:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python: ["3.10", "3.11", "3.12", "3.13"]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -26,3 +43,24 @@ jobs:
           huh 1696500000
           printf '%s' 'SGVsbG8=' | huh
           huh --json 137 > /dev/null
+
+  build:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --quiet --upgrade pip build twine
+          python -m build
+          python -m twine check dist/*
+      - name: Install the wheel in a clean environment
+        run: |
+          python -m venv /tmp/huh-venv
+          /tmp/huh-venv/bin/python -m pip install --quiet dist/*.whl
+          /tmp/huh-venv/bin/huh --version
+          /tmp/huh-venv/bin/huh 1696500000 | grep -q "epoch seconds"

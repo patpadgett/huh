@@ -7,7 +7,6 @@ import datetime as dt
 import io
 import json
 import os
-import shlex
 import subprocess
 import sys
 import tempfile

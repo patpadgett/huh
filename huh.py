@@ -2339,7 +2339,7 @@ def detect_http_status(s: str, ctx: Context):
     if n in HTTP_HINTS:
         lines.append(HTTP_HINTS[n])
     conf = 0.85 if n in HTTP_HINTS or n in (100, 101, 203, 205, 300, 303, 305, 402, 406, 407, 411, 412, 414, 416, 417, 423, 424, 426, 428, 431, 451, 505, 506, 507, 508, 510, 511) else 0.5
-    receipt = f"curl -sS -o /dev/null -w '%{{http_code}}\\n' URL   # what a URL actually returns"
+    receipt = "curl -sS -o /dev/null -w '%{http_code}\\n' URL   # what a URL actually returns"
     return [Reading("http status", conf, f"HTTP {n} {phrase}: {HTTP_HINTS.get(n, cls)}", lines, receipt, data={"code": n, "phrase": phrase})]
 
 
@@ -2833,7 +2833,7 @@ def detect_mac(s: str, ctx: Context):
         lines.append(f"OUI {digits[:6]}: {vendor}" if vendor else f"OUI {digits[:6]} (universally administered; no local vendor database found to name it)")
     eui64 = f"{first ^ 2:02x}{octets[1]:02x}:{octets[2]:02x}ff:fe{octets[3]:02x}:{octets[4]:02x}{octets[5]:02x}"
     lines.append(f"IPv6 link-local via EUI-64: fe80::{eui64}")
-    lines.append(f"Wake-on-LAN magic packet payload: ff*6 + this address x16")
+    lines.append("Wake-on-LAN magic packet payload: ff*6 + this address x16")
     conf = 0.9 if m.re.pattern.count("\\2") else 0.75
     receipt = f"grep -i {q(digits[:6])} /usr/share/ieee-data/oui.txt" if os.path.exists("/usr/share/ieee-data/oui.txt") else "ip link   # your own interfaces' MACs"
     summary = f"MAC {canonical}: " + ("broadcast" if canonical == "ff:ff:ff:ff:ff:ff" else "locally administered (virtual/randomized)" if first & 2 else
@@ -2920,7 +2920,7 @@ def detect_sri(s: str, ctx: Context):
     lines = []
     if re.fullmatch(r"[0-9a-f]+", value):
         lines.append(f"{algo} digest in hex (docker image digests look like this: sha256:...)")
-        receipt = f"docker image inspect --format '{{{{.Id}}}}' IMAGE" if algo == "sha256" and len(value) == 64 else None
+        receipt = "docker image inspect --format '{{.Id}}' IMAGE" if algo == "sha256" and len(value) == 64 else None
         what = "digest reference"
     else:
         raw = base64.b64decode(value + "=" * (-len(value) % 4)) if len(value) % 4 != 1 else b""
