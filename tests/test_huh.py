@@ -7,10 +7,10 @@ import datetime as dt
 import io
 import json
 import os
-import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -73,6 +73,9 @@ class SchemaTests(unittest.TestCase):
         self.assertIn("epoch seconds", names)
         self.assertIn("cron", names)
         self.assertIn("shadow", names)
+        self.assertIn("url-encoded", names)
+        self.assertIn("unicode", names)
+        self.assertNotIn("mojibake", names)
         self.assertEqual(len(names), len(set(names)))
 
 
@@ -94,6 +97,13 @@ class EpochTests(unittest.TestCase):
         r = best("1696500000.5")
         self.assertEqual(r.kind, "epoch seconds")
         self.assertIn("10:00:00.5", r.summary)
+        self.assertEqual(r.receipt, "date -u -d @1696500000.5")
+
+    def test_nanoseconds_keep_all_digits(self):
+        r = best("1696500000123456789")
+        self.assertIn("2023-10-05T10:00:00.123456789Z", joined(r))
+        self.assertEqual(r.data["nanos"], 123456789)
+        self.assertIn("@1696500000.123456789", r.receipt)
 
     def test_local_zone_and_receipt(self):
         r = best("1696500000", tz="America/New_York")
@@ -144,6 +154,13 @@ class DateTests(unittest.TestCase):
         r = find("2024-01-01 09:00 EST", "date")
         self.assertIn("2024-01-01T14:00:00Z", joined(r))
 
+    def test_receipts_use_the_computed_epoch(self):
+        r = find("2024-01-01 09:00", "date", tz="America/New_York")
+        self.assertEqual(r.receipt, "TZ=America/New_York date -d @1704117600")
+        r = find("2024-01-01T12:30:00Z", "date", tz="Asia/Tokyo")
+        self.assertIn("date -u -d @1704112200", r.receipt)
+        self.assertIn("TZ=Asia/Tokyo date -d @1704112200", r.receipt)
+
     def test_dst_gap_and_fold_flagged(self):
         gap = find("2024-03-10 02:30", "date", tz="America/New_York")
         self.assertIn("does not exist", joined(gap))
@@ -164,12 +181,30 @@ class DateTests(unittest.TestCase):
         r2 = find("14:00 UTC", "time", tz="America/New_York")
         self.assertIn("10:00 EDT", r2.summary)
         self.assertIn("12:00 EST", find("noon EST", "time").summary)
+        r3 = find("noon UTC", "time")
+        self.assertTrue(r3.summary.endswith("the same everywhere you asked"))
+        self.assertIn("@1791288000", r3.receipt)
 
     def test_strftime(self):
         r = find("%Y-%m-%dT%H:%M:%S%z", "strftime")
         self.assertIn("2026-10-06T14:00:00+0000", r.summary)
         self.assertEqual(r.receipt, "date +%Y-%m-%dT%H:%M:%S%z")
         self.assertEqual(find("%F %T", "strftime").receipt, "date '+%F %T'")
+        self.assertTrue(find("%Y-%m-%d %f", "strftime").receipt.startswith("python3 -c"))
+
+
+class ReceiptReplayTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "GNU date receipts")
+    def run_receipt(self, receipt):
+        return subprocess.run(["bash", "-c", receipt], capture_output=True, text=True, timeout=5).stdout
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "GNU date receipts")
+    def test_date_and_epoch_receipts_replay(self):
+        self.assertIn("10:00:00", self.run_receipt(find("1696500000.5", "epoch seconds").receipt))
+        self.assertIn("10:00:00.123456789", self.run_receipt(find("1696500000123456789", "epoch nanos").receipt))
+        self.assertIn("09:00:00 EST", self.run_receipt(find("2024-01-01 09:00", "date", tz="America/New_York").receipt))
+        self.assertIn("12:00:00", self.run_receipt(find("noon UTC", "time").receipt))
+        self.assertIn("Dec 24", self.run_receipt(find("1341923634421944320", "snowflake").receipt))
 
 
 class DurationTests(unittest.TestCase):
@@ -243,6 +278,16 @@ class CronTests(unittest.TestCase):
         r = find("0 0 * * * *", "cron")
         self.assertIn("seconds field", joined(r))
 
+    def test_six_field_seconds_are_used(self):
+        r = find("30 0 * * * *", "cron")
+        self.assertEqual(r.data["next"][0], "2026-10-06T14:00:30Z")
+        self.assertEqual(r.data["systemd"], "*-*-* *:00:30")
+
+    def test_one_word_command(self):
+        r = find("0 2 * * * backup", "cron")
+        self.assertIn("backup", r.summary)
+        self.assertEqual(r.data["next"][0], "2026-10-07T02:00:00Z")
+
     def test_crontab_line_with_command(self):
         r = find("0 2 * * * /usr/local/bin/backup.sh >> /var/log/backup.log 2>&1", "cron")
         self.assertIn("backup.sh", joined(r))
@@ -267,6 +312,7 @@ class TimezoneTests(unittest.TestCase):
     def test_city(self):
         self.assertEqual(find("tokyo", "timezone").data["zone"], "Asia/Tokyo")
         self.assertEqual(find("new york", "timezone").data["zone"], "America/New_York")
+        self.assertEqual(find("asia/tokyo", "timezone").data["zone"], "Asia/Tokyo")
 
     def test_offset(self):
         self.assertEqual(find("+05:30", "timezone").data["offset"], "UTC+05:30")
@@ -388,6 +434,41 @@ class EncodingTests(unittest.TestCase):
         self.assertIn("’", best("â€™").summary)
 
 
+class SecretOutputTests(unittest.TestCase):
+    def test_url_credentials_are_masked_and_get_no_receipt(self):
+        url = "https://alice:" + "s3cr3t" + "@example.com/path?token=" + "abcdefghijk" + "&x=1696500000"
+        r = find(url, "url")
+        self.assertIsNone(r.receipt)
+        text = joined(r)
+        self.assertNotIn("s3cr3t", text)
+        self.assertNotIn("abcdefghijk", text)
+        self.assertIn("<password>", text)
+        self.assertIn("<redacted>", text)
+        self.assertTrue(r.data["redacted"])
+        self.assertIn("epoch seconds", [c.kind for c in r.children])
+
+    def test_url_encoded_credentials_are_masked(self):
+        text = "https%3A%2F%2Falice%3As3cr3t%40example.com%2F"
+        r = find(text, "url-encoded")
+        self.assertIsNone(r.receipt)
+        self.assertNotIn("s3cr3t", joined(r))
+        self.assertTrue(r.data["redacted"])
+
+    def test_json_credentials_are_masked(self):
+        text = '{"config":{"password":"hunter2"},"created":1696500000}'
+        r = find(text, "json")
+        self.assertIsNone(r.receipt)
+        self.assertNotIn("hunter2", joined(r))
+        self.assertIn("<redacted>", joined(r))
+        self.assertTrue(r.data["redacted"])
+        self.assertIn("epoch seconds", [c.kind for c in r.children])
+
+    def test_plain_url_keeps_its_receipt(self):
+        r = find("https://example.com/path?x=1696500000", "url")
+        self.assertIsNotNone(r.receipt)
+        self.assertFalse(r.data["redacted"])
+
+
 class UnicodeTests(unittest.TestCase):
     def test_zero_width_space(self):
         r = best("caf\u200b\u00e9")
@@ -431,6 +512,14 @@ class NumberTests(unittest.TestCase):
         r = find("1536000", "number")
         self.assertIn("1.465 MiB", joined(r))
         self.assertIn("17d 18h 40m", joined(r))
+
+    def test_big_numbers_use_python_receipts(self):
+        r = find("18446744073709551615", "number")
+        self.assertIn("quintillion", joined(r))
+        self.assertTrue(r.receipt.startswith("python3 -c"))
+        self.assertIn("18446744073709551615", r.receipt)
+        r = find("2**100", "arithmetic")
+        self.assertTrue(r.receipt.startswith("python3 -c"))
 
     def test_arithmetic(self):
         self.assertIn("= 265", best("0xff + 0b1010").summary)
@@ -533,6 +622,8 @@ class SystemCodeTests(unittest.TestCase):
         self.assertEqual(best("hsl(120,100%,50%)").data["hex"], "#00ff00")
         self.assertEqual(best("rebeccapurple").data["hex"], "#663399")
         self.assertIn("WCAG", joined(r))
+        for text in ["rgb(300,0,0)", "hsl(120,150%,50%)", "rgba(0,0,0,2)", "hsla(0,100%,50%,150%)"]:
+            self.assertNotIn("color", kinds(text), text)
 
 
 class IdentifierTests(unittest.TestCase):
@@ -557,6 +648,7 @@ class IdentifierTests(unittest.TestCase):
         r = find("1341923634421944320", "snowflake")
         self.assertIn("Twitter/X", r.summary)
         self.assertIn("2020-12-24", r.data["iso"])
+        self.assertIn("/ 1000", r.receipt)
 
     def test_ip(self):
         r = best("192.168.1.10:8080")
@@ -569,6 +661,9 @@ class IdentifierTests(unittest.TestCase):
         self.assertIn("public", best("8.8.8.8").summary)
         self.assertIn("Cloudflare", best("1.1.1.1").summary)
         self.assertEqual(readings("256.1.1.1"), [])
+        bad = find("10.0.0.1:99999", "ip")
+        self.assertNotIn(":99999", bad.summary)
+        self.assertIn("out of range", joined(bad))
 
     def test_cidr(self):
         r = best("10.0.0.0/22")
@@ -665,7 +760,8 @@ class IdentifierTests(unittest.TestCase):
         for args, kwargs in calls:
             self.assertEqual(args[0], "git")
             self.assertNotIn("shell", kwargs)
-            self.assertEqual(kwargs["timeout"], huh.GIT_TIMEOUT)
+            self.assertGreater(kwargs["timeout"], 0)
+            self.assertLessEqual(kwargs["timeout"], huh.GIT_TIMEOUT)
             self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
             self.assertIn("core.hooksPath=/dev/null", args)
             self.assertFalse(any(a in ("push", "fetch", "pull", "commit", "checkout", "reset") for a in args))
@@ -720,6 +816,7 @@ class FileTests(unittest.TestCase):
         self.assertEqual(r.kind, "coordinates")
         self.assertIn("27.95060, -82.45720", r.summary)
         self.assertIn("openstreetmap", joined(r))
+        self.assertIn("-82.45720", best("27.9506 n, 82.4572 w").summary)
         self.assertEqual(readings("0, 0"), [])
 
     def test_binary_blob(self):
@@ -738,7 +835,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_rendered_output_has_no_raw_escapes(self):
         for text in ["\x1b[31mred\x1b[0m", "a\u200bb", "\u202eevil", "\x07bell", "\x1b]0;title\x07"]:
-            out = huh.render(readings(text), 1, False, 100)
+            out = huh.render(readings(text), 1, 100)
             for ch in out:
                 self.assertFalse(ord(ch) < 32 and ch not in "\n\t", f"control char {ord(ch):#x} in output for {text!r}")
             self.assertNotIn("\u200b", out)
@@ -787,8 +884,38 @@ class SafetyTests(unittest.TestCase):
         ok = subprocess.CompletedProcess([], 0, b"1696500000", b"")
         with mock.patch.object(huh, "have", return_value=True), mock.patch.object(huh.subprocess, "run", return_value=ok) as run:
             self.assertEqual(huh.read_clipboard(), "1696500000")
-            self.assertEqual(run.call_args.kwargs["timeout"], huh.CLIP_TIMEOUT)
+            self.assertGreater(run.call_args.kwargs["timeout"], 0)
+            self.assertLessEqual(run.call_args.kwargs["timeout"], huh.CLIP_TIMEOUT)
             self.assertNotIn("shell", run.call_args.kwargs)
+
+
+class HostileInputTests(unittest.TestCase):
+    def assert_fast(self, fn, *args, limit=1.0):
+        start = time.perf_counter()
+        result = fn(*args)
+        elapsed = time.perf_counter() - start
+        self.assertLess(elapsed, limit, f"took {elapsed:.3f}s")
+        return result
+
+    def test_duration_rejects_64k_digits_quickly(self):
+        self.assertIsNone(self.assert_fast(huh.parse_duration, "1" * huh.MAX_INPUT))
+        self.assertIsNone(self.assert_fast(huh.parse_duration, ("1h " * 20000)))
+
+    def test_pem_regex_is_linear(self):
+        self.assertIsNone(self.assert_fast(
+            huh.detect_pem, "-----BEGIN A-----" * 4000, ctx()))
+
+    def test_bcrypt_cost_is_bounded(self):
+        r = self.assert_fast(huh.detect_password_hash, "$2b$999999999$abcdefghijklmnopqrstuv", ctx())
+        self.assertTrue(r)
+        self.assertIn("outside the valid bcrypt range", joined(r[0]))
+        self.assert_fast(huh.detect_password_hash, "$2b$" + "9" * 5000 + "$x", ctx())
+
+    def test_have_is_cached(self):
+        huh.have("sh")
+        before = huh.have.cache_info().hits
+        huh.have("sh")
+        self.assertGreater(huh.have.cache_info().hits, before)
 
 
 class CLITests(unittest.TestCase):
@@ -810,6 +937,20 @@ class CLITests(unittest.TestCase):
         self.assertIn("chmod 755", p.stdout)
         self.assertEqual(self.run_cli("-1").returncode, 0)
         self.assertEqual(self.run_cli("-9").returncode, 0)
+        p = self.run_cli("-rwxr-xr-x", "-n", "1")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("chmod 755", p.stdout)
+
+    def test_unknown_options_fail_instead_of_becoming_input(self):
+        p = self.run_cli("--jsn", "137")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("unrecognized arguments: --jsn", p.stderr)
+        self.assertEqual(self.run_cli("-z").returncode, 2)
+
+    def test_double_dash_passes_odd_text(self):
+        p = self.run_cli("--", "-z")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("no idea", p.stdout)
 
     def test_multiword_without_quotes(self):
         p = self.run_cli("0", "*/4", "*", "*", "1-5")
@@ -829,6 +970,19 @@ class CLITests(unittest.TestCase):
         self.assertEqual(data["readings"][0]["kind"], "exit code")
         self.assertLessEqual(len(data["readings"]), 5)
 
+    def test_json_exit_code_reflects_readings(self):
+        p = self.run_cli("--json", "hello")
+        self.assertEqual(p.returncode, 1)
+        self.assertEqual(json.loads(p.stdout)["readings"], [])
+
+    def test_json_escapes_bidi_and_redacts_secrets(self):
+        p = self.run_cli("--json", "\u202eevil")
+        self.assertNotIn("\u202e", p.stdout)
+        self.assertIn("\\u202e", p.stdout)
+        p = self.run_cli("--json", '{"password":"hunter2"}')
+        self.assertNotIn("hunter2", p.stdout)
+        self.assertTrue(json.loads(p.stdout)["input_redacted"])
+
     def test_all_and_max_and_type(self):
         few = json.loads(self.run_cli("--json", "137").stdout)["readings"]
         every = json.loads(self.run_cli("--json", "--all", "137").stdout)["readings"]
@@ -837,6 +991,18 @@ class CLITests(unittest.TestCase):
         self.assertEqual(len(one), 1)
         only = json.loads(self.run_cli("--json", "--type", "chmod", "137").stdout)["readings"]
         self.assertEqual([r["kind"] for r in only], ["chmod"])
+        p = self.run_cli("--max", "0", "137")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("--max must be at least 1", p.stderr)
+
+    def test_type_normalization_and_aliases(self):
+        data = json.loads(self.run_cli("--json", "--type", "url encoded", "hello%20world").stdout)
+        self.assertEqual([r["kind"] for r in data["readings"]], ["url-encoded"])
+        data = json.loads(self.run_cli("--json", "--type", "mojibake", "caf\u00c3\u00a9").stdout)
+        self.assertEqual([r["kind"] for r in data["readings"]], ["unicode"])
+        data = json.loads(self.run_cli("--json", "--type", "epoch", "1696500000").stdout)
+        self.assertTrue(data["readings"])
+        self.assertTrue(all(r["kind"].startswith("epoch ") for r in data["readings"]))
 
     def test_tz(self):
         p = self.run_cli("--tz", "America/New_York,Asia/Tokyo", "1696500000")

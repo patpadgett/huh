@@ -25,6 +25,7 @@ import colorsys
 import datetime as dt
 import email.utils
 import errno as errno_mod
+import functools
 import html
 import http
 import ipaddress
@@ -211,7 +212,9 @@ def hexdump(data: bytes, n: int = 16) -> str:
     return " ".join(f"{b:02x}" for b in data[:n]) + (" ..." if len(data) > n else "")
 
 
+@functools.cache
 def have(tool: str) -> bool:
+    """Is *tool* on PATH? Cached: PATH does not change during a run, and shutil.which is not cheap."""
     return shutil.which(tool) is not None
 
 
@@ -290,10 +293,13 @@ def fmt(d: dt.datetime, zone: dt.tzinfo | None = None, seconds: bool = True, nan
     return f"{text} {zone_label(d)}"
 
 
-def iso(d: dt.datetime) -> str:
+def iso(d: dt.datetime, nanos: int | None = None) -> str:
     d = d.astimezone(UTC)
     text = d.strftime("%Y-%m-%dT%H:%M:%S")
-    if d.microsecond:
+    if nanos is not None:
+        if nanos:
+            text += ("." + f"{nanos:09d}").rstrip("0")
+    elif d.microsecond:
         text += ("." + f"{d.microsecond:06d}").rstrip("0")
     return text + "Z"
 
@@ -454,8 +460,12 @@ TZ_ABBR: dict[str, tuple[str, int | None, str, str | None]] = {
 OFFSET_RE = re.compile(r"(?:UTC|GMT)?\s*([+-])(\d{1,2})(?::?(\d{2}))?", re.I)
 
 
+_ZONE_BY_LOWER: dict[str, str] | None = None
+
+
 def resolve_zone(token: str) -> tuple[dt.tzinfo, str, list[str]] | None:
     """tzinfo for an IANA name, an abbreviation, or an offset: (tz, label, notes)."""
+    global _ZONE_BY_LOWER
     t = token.strip()
     if not t:
         return None
@@ -464,6 +474,16 @@ def resolve_zone(token: str) -> tuple[dt.tzinfo, str, list[str]] | None:
         try:
             return ZoneInfo(name), name, []
         except (ZoneInfoNotFoundError, ValueError, OSError):
+            if "/" not in t:
+                return None
+            if _ZONE_BY_LOWER is None:
+                _ZONE_BY_LOWER = {z.lower(): z for z in available_timezones()}
+            canonical = _ZONE_BY_LOWER.get(t.lower())
+            if canonical:
+                try:
+                    return ZoneInfo(canonical), canonical, []
+                except (ZoneInfoNotFoundError, ValueError, OSError):
+                    pass
             return None
     m = OFFSET_RE.fullmatch(t)
     if m:
@@ -557,14 +577,15 @@ def detect_epoch(s: str, ctx: Context):
         digits_note = f"{plural(len(whole_digits), 'digit')}, read as {unit} since 1970-01-01 UTC"
         local = d.astimezone(ctx.zone)
         show_nanos = nanos if divisor >= 10**6 else None
-        receipt = epoch_receipt(whole_digits if not negative else "-" + whole_digits, divisor, ctx.zone)
+        numeric = ("-" if negative else "") + whole_digits + ("." + frac_digits if frac_digits else "")
+        receipt = epoch_receipt(numeric, divisor, ctx.zone)
         if conf < 0.4:
             unlikely.append((conf, kind, unit, d, local, show_nanos, receipt, digits_note))
             continue
         lines = zone_lines(d, ctx, skip_offset=local.utcoffset(), nanos=show_nanos)
-        lines.append(f"ISO {iso(d)}  -  {digits_note}")
+        lines.append(f"ISO {iso(d, show_nanos)}  -  {digits_note}")
         out.append(Reading(kind, conf, f"{fmt(local, nanos=show_nanos)}, {relative(d, ctx.now)}", lines, receipt,
-                           data={"iso": iso(d), "unit": unit, "seconds": secs}))
+                           data={"iso": iso(d, show_nanos), "unit": unit, "seconds": secs, "nanos": nanos}))
     if unlikely and not out:
         # Nothing plausible: one compact reading instead of four lines of 1970.
         unlikely.sort(key=lambda u: -u[0])
@@ -574,7 +595,7 @@ def detect_epoch(s: str, ctx: Context):
         if others:
             lines.append(f"other units: {others}")
         out.append(Reading(kind, conf, f"{fmt(local, nanos=show_nanos)} if {unit} - unlikely", lines, receipt,
-                           data={"iso": iso(d), "unit": unit}))
+                           data={"iso": iso(d, show_nanos), "unit": unit}))
     # Windows FILETIME: 100 ns ticks since 1601-01-01, 18 digits around now.
     if len(whole_digits) == 18 and not frac_digits and not negative:
         secs = whole / 10**7 - 11644473600
@@ -655,12 +676,15 @@ def parse_date(s: str) -> tuple[dt.datetime, str, bool] | None:
     return parsed, how, parsed.tzinfo is not None
 
 
-def date_receipt(s: str, zone: dt.tzinfo, aware: bool) -> str:
+def date_receipt(epoch: int, zone: dt.tzinfo, aware: bool) -> str:
+    """A portable-enough receipt for an instant. Using @epoch avoids re-parsing the original text."""
     key = zone_key(zone)
-    core = q(s)
-    if aware or key in ("UTC", "Etc/UTC"):
-        return f"date -u -d {core}; date -d {core} +%s"
-    return f"TZ={q(key)} date -d {core}; TZ={q(key)} date -d {core} +%s"
+    base = f"date -u -d @{epoch}"
+    if aware or key in ("UTC", "Etc/UTC") or "/" not in key:
+        if key not in ("UTC", "Etc/UTC") and "/" in key:
+            return f"{base}   # local: TZ={q(key)} date -d @{epoch}"
+        return base
+    return f"TZ={q(key)} date -d @{epoch}"
 
 
 @detector
@@ -708,7 +732,7 @@ def detect_date(s: str, ctx: Context):
     summary = f"{fmt(instant, ctx.zone) if aware else fmt(instant)}, {relative(instant, ctx.now)}"
     if not aware:
         summary = f"{fmt(d.replace(tzinfo=ctx.zone))} (zone assumed), {relative(instant, ctx.now)}"
-    return [Reading("date", conf, summary, lines, date_receipt(s, ctx.zone, aware),
+    return [Reading("date", conf, summary, lines, date_receipt(epoch, ctx.zone, aware),
                     data={"iso": iso(instant), "epoch": epoch, "zone_given": aware})]
 
 
@@ -723,8 +747,6 @@ def detect_time_of_day(s: str, ctx: Context):
     m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?(?::(\d{2}))?\s*([ap]\.?m\.?)?(?:\s+(\S+))?", text, re.I)
     if not m or (not m.group(2) and not m.group(4)):
         return None
-    if m.group(3) and not m.group(5) and not m.group(4) and ctx.depth == 0 and int(m.group(1)) < 24:
-        pass  # "01:30:00" reads as both a duration and a time; let both speak
     hour, minute, second = int(m.group(1)), int(m.group(2) or 0), int(m.group(3) or 0)
     ampm, zone_token = m.group(4), m.group(5)
     if ampm:
@@ -743,20 +765,21 @@ def detect_time_of_day(s: str, ctx: Context):
         source_zone, notes = ctx.zone, []
     today = ctx.now.astimezone(source_zone).date()
     wall = dt.datetime(today.year, today.month, today.day, hour, minute, second, tzinfo=source_zone)
+    line_fmt = "%H:%M:%S" if second else "%H:%M"
     lines = list(notes)
-    lines.append(f"{wall.strftime('%H:%M')} {label or zone_key(source_zone)} today is:")
+    lines.append(f"{wall.strftime(line_fmt)} {label or zone_key(source_zone)} today is:")
     lines.extend("  " + line for line in zone_lines(wall, ctx, skip_offset=wall.utcoffset()))
     if not any(wall.astimezone(z).utcoffset() == dt.timedelta(0) for z in ctx.zones) and wall.utcoffset() != dt.timedelta(0):
         lines.append(f"  {fmt(wall, UTC)}")
     conf = 0.85 if zone_token else 0.5
     if m_word:
         conf = 0.8 if zone_token else 0.6
-    receipt = f"date -d 'TZ=\"{zone_key(source_zone)}\" {hour:02d}:{minute:02d}'" if "/" in zone_key(source_zone) \
-        else f"date -d {q(f'{hour:02d}:{minute:02d} {label or zone_key(source_zone)}')}"
-    return [Reading("time", conf, f"{wall.strftime('%H:%M')} {label or zone_key(source_zone)} = "
-                    + ", ".join(f"{wall.astimezone(z).strftime('%H:%M')} {zone_label(wall.astimezone(z))}" for z in ctx.zones
-                                if wall.astimezone(z).utcoffset() != wall.utcoffset()) or "the same everywhere you asked",
-                    lines, receipt)]
+    converted = ", ".join(f"{wall.astimezone(z).strftime('%H:%M')} {zone_label(wall.astimezone(z))}" for z in ctx.zones
+                          if wall.astimezone(z).utcoffset() != wall.utcoffset())
+    receipt = date_receipt(int(wall.timestamp()), source_zone, True)
+    return [Reading("time", conf, f"{wall.strftime(line_fmt)} {label or zone_key(source_zone)} = "
+                    + (converted or "the same everywhere you asked"), lines, receipt,
+                    data={"epoch": int(wall.timestamp())})]
 
 
 DURATION_UNITS = {
@@ -769,6 +792,8 @@ DURATION_UNITS = {
 
 def parse_duration(s: str) -> tuple[float, str] | None:
     """Seconds for '1h 30m', '90min', '1.5h', 'PT1H30M', '01:30:00', '2d4h'; plus how it was read."""
+    if len(s) > 256:
+        return None  # durations are short; this also keeps hostile input linear
     m = re.fullmatch(r"(?i)P(?:(\d+(?:\.\d+)?)Y)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)W)?(?:(\d+(?:\.\d+)?)D)?"
                      r"(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?", s)
     if m and any(m.groups()) and s.upper() != "P":
@@ -781,16 +806,35 @@ def parse_duration(s: str) -> tuple[float, str] | None:
         h, mi, sec, frac = m.groups()
         total = int(h) * 3600 + int(mi) * 60 + int(sec) + (float("0." + frac) if frac else 0)
         return total, "H:MM:SS"
-    tokens = re.findall(r"(\d+(?:\.\d+)?)\s*([a-zA-Zµμ]+)", s)
-    if tokens and re.fullmatch(r"(?:\s*\d+(?:\.\d+)?\s*[a-zA-Zµμ]+\s*,?(?:\s+and\s+)?)+", s):
-        total = 0.0
-        for number, unit in tokens:
-            u = unit.lower().rstrip("s") if unit.lower() not in ("s", "ms", "us", "ns") else unit.lower()
-            if u not in DURATION_UNITS:
-                return None
-            total += float(number) * DURATION_UNITS[u]
-        return total, "units"
-    return None
+    # Linear tokenizer instead of a nested-quantifier regex. Accepts "1h 30m",
+    # "1h30m", "1h, 30m", and "1h and 30m"; rejects anything else.
+    token_re = re.compile(r"\s*(\d+(?:\.\d+)?)\s*([a-zA-Zµμ]+)")
+    sep_re = re.compile(r"\s*(?:,\s*)?(?:and\s+)?", re.I)
+    total = 0.0
+    pos = 0
+    found = False
+    while pos < len(s):
+        m = token_re.match(s, pos)
+        if not m:
+            return None
+        number, unit = m.groups()
+        u = unit.lower()
+        if u not in ("s", "ms", "us", "ns", "µs", "μs"):
+            u = u.rstrip("s")
+        if u not in DURATION_UNITS:
+            return None
+        total += float(number) * DURATION_UNITS[u]
+        found = True
+        pos = m.end()
+        if pos >= len(s):
+            break
+        if s[pos].isdigit():
+            continue  # "1h30m"
+        sep = sep_re.match(s, pos)
+        if not sep or sep.end() == pos:
+            return None
+        pos = sep.end()
+    return (total, "units") if found else None
 
 
 @detector
@@ -955,7 +999,7 @@ def cron_english(mins: CronField, hours: CronField, dom: CronField, mon: CronFie
 
 
 def cron_next(fields: tuple[CronField, ...], zone: dt.tzinfo, now: dt.datetime, count: int = 3,
-              horizon_days: int = 366 * 5) -> tuple[list[dt.datetime], list[str]]:
+              horizon_days: int = 366 * 5, seconds: CronField | None = None) -> tuple[list[dt.datetime], list[str]]:
     """Next *count* fire times after *now*, honest about DST: a wall time that does not exist
     (spring forward) is skipped; one that happens twice (fall back) is listed once, the first time."""
     mins, hours, dom, mon, dow = fields
@@ -964,6 +1008,8 @@ def cron_next(fields: tuple[CronField, ...], zone: dt.tzinfo, now: dt.datetime, 
     start_local = now.astimezone(zone)
     day = start_local.date()
     hour_list, min_list = sorted(hours.values), sorted(mins.values)
+    sec_list = sorted(seconds.values) if seconds else [0]
+    stamp = "%H:%M:%S" if seconds else "%H:%M"
     for offset in range(horizon_days):
         date = day + dt.timedelta(days=offset)
         if date.month not in mon.values:
@@ -974,26 +1020,28 @@ def cron_next(fields: tuple[CronField, ...], zone: dt.tzinfo, now: dt.datetime, 
             continue
         for h in hour_list:
             for m in min_list:
-                naive = dt.datetime(date.year, date.month, date.day, h, m)
-                aware = naive.replace(tzinfo=zone, fold=0)
-                # Verify the wall time exists: round-trip through UTC.
-                back = aware.astimezone(UTC).astimezone(zone)
-                if back.replace(tzinfo=None) != naive:
-                    if aware > now and len(notes) < 2:
-                        notes.append(f"{naive:%Y-%m-%d %H:%M} does not exist in {zone_key(zone)} (clocks jump forward); skipped")
-                    continue
-                if aware <= now:
-                    continue
-                found.append(aware)
-                if aware.replace(fold=1).utcoffset() != aware.utcoffset() and len(notes) < 2:
-                    notes.append(f"{naive:%Y-%m-%d %H:%M} happens twice in {zone_key(zone)} (clocks fall back); "
-                                 "most cron daemons run it once, some twice")
-                if len(found) >= count:
-                    return found, notes
+                for s in sec_list:
+                    naive = dt.datetime(date.year, date.month, date.day, h, m, s)
+                    aware = naive.replace(tzinfo=zone, fold=0)
+                    # Verify the wall time exists: round-trip through UTC.
+                    back = aware.astimezone(UTC).astimezone(zone)
+                    if back.replace(tzinfo=None) != naive:
+                        if aware > now and len(notes) < 2:
+                            notes.append(f"{naive.strftime('%Y-%m-%d ' + stamp)} does not exist in {zone_key(zone)} (clocks jump forward); skipped")
+                        continue
+                    if aware <= now:
+                        continue
+                    found.append(aware)
+                    if aware.replace(fold=1).utcoffset() != aware.utcoffset() and len(notes) < 2:
+                        notes.append(f"{naive.strftime('%Y-%m-%d ' + stamp)} happens twice in {zone_key(zone)} (clocks fall back); "
+                                     "most cron daemons run it once, some twice")
+                    if len(found) >= count:
+                        return found, notes
     return found, notes
 
 
-def cron_to_systemd(mins: CronField, hours: CronField, dom: CronField, mon: CronField, dow: CronField) -> str | None:
+def cron_to_systemd(mins: CronField, hours: CronField, dom: CronField, mon: CronField, dow: CronField,
+                    seconds: CronField | None = None) -> str | None:
     """OnCalendar= form for the same schedule, when the schedule is expressible."""
     def part(f: CronField, names: dict | None = None) -> str | None:
         if f.star and f.step in (None, 1):
@@ -1010,7 +1058,8 @@ def cron_to_systemd(mins: CronField, hours: CronField, dom: CronField, mon: Cron
         return ",".join(f"{v:02d}" for v in values)
 
     m_text, h_text, d_text, mo_text = part(mins), part(hours), part(dom), part(mon)
-    if None in (m_text, h_text, d_text, mo_text):
+    s_text = "00" if seconds is None or seconds.values == {0} else part(seconds)
+    if None in (m_text, h_text, d_text, mo_text, s_text):
         return None
     if not (dom.star or dow.star):
         return None  # cron's OR between day fields has no systemd equivalent
@@ -1022,7 +1071,7 @@ def cron_to_systemd(mins: CronField, hours: CronField, dom: CronField, mon: Cron
             weekdays = f"{names[values[0]]}..{names[values[-1]]} "
         else:
             weekdays = ",".join(names[v] for v in values) + " "
-    return f"{weekdays}*-{mo_text}-{d_text} {h_text}:{m_text}:00"
+    return f"{weekdays}*-{mo_text}-{d_text} {h_text}:{m_text}:{s_text}"
 
 
 @detector
@@ -1036,72 +1085,81 @@ def detect_cron(s: str, ctx: Context):
                         ["cron alias; no schedule, no next run", "equivalent systemd unit: WantedBy=multi-user.target with a oneshot service"],
                         None)]
     parts = text.split()
-    command = None
-    if len(parts) > 6 or (len(parts) == 6 and not re.fullmatch(r"[\d*,/-]+", parts[0])):
-        # A crontab line: five fields followed by the command (or, in /etc/crontab, a user then the command).
-        if len(text) > 400 or not all(re.fullmatch(r"[\w*,/-]+", p) for p in parts[:5]) or all(p == "*" for p in parts[5:]):
-            return None
-        command, parts = " ".join(parts[5:]), parts[:5]
-    if len(parts) not in (5, 6) or len(text) > 400:
+    if len(parts) < 5 or len(text) > 400:
         return None
+
+    def parse_fields(field_texts: list[str]) -> tuple[CronField, ...]:
+        return (cron_field(field_texts[0], 0, 59), cron_field(field_texts[1], 0, 23),
+                cron_field(field_texts[2], 1, 31), cron_field(field_texts[3], 1, 12, MONTH_NAMES),
+                cron_field(field_texts[4], 0, 7, DAY_NAMES, sunday7=True))
+
+    command = None
     seconds_field = None
-    if len(parts) == 6:
-        seconds_field, parts = parts[0], parts[1:]   # Quartz/Spring style with a seconds column
-        if not re.fullmatch(r"[\d*,/-]+", seconds_field):
-            return None
+    if len(parts) == 5:
+        field_texts = parts
+    elif len(parts) == 6:
+        # A six-token line is either Quartz-style seconds + five fields, or five fields + a one-word command.
+        try:
+            candidate_seconds = cron_field(parts[0], 0, 59)
+            parse_fields(parts[1:])
+            seconds_field, field_texts = candidate_seconds, parts[1:]
+        except ValueError:
+            command, field_texts = parts[5], parts[:5]
+    else:
+        # Five fields followed by the command (or, in /etc/crontab, a user then the command).
+        command, field_texts = " ".join(parts[5:]), parts[:5]
+    if command is not None and (not command.strip() or all(p == "*" for p in command.split())):
+        return None
     try:
-        mins = cron_field(parts[0], 0, 59)
-        hours = cron_field(parts[1], 0, 23)
-        dom = cron_field(parts[2], 1, 31)
-        mon = cron_field(parts[3], 1, 12, MONTH_NAMES)
-        dow = cron_field(parts[4], 0, 7, DAY_NAMES, sunday7=True)
+        fields = parse_fields(field_texts)
     except ValueError:
         return None
-    fields = (mins, hours, dom, mon, dow)
+    mins, hours, dom, mon, dow = fields
     english = cron_english(*fields)
-    upcoming, notes = cron_next(fields, ctx.zone, ctx.now)
+    upcoming, notes = cron_next(fields, ctx.zone, ctx.now, seconds=seconds_field)
     lines = []
     if alias:
         lines.append(f"{alias} expands to {text}")
-    lines.append("fields: minute hour day-of-month month day-of-week  =  " + "  ".join(parts))
+    lines.append("fields: minute hour day-of-month month day-of-week  =  " + "  ".join(field_texts))
     if command:
-        user_then_command = re.match(r"([a-z_][a-z0-9_-]{0,31})\s+(/.*|[a-z].*)", command)
-        if user_then_command and user_then_command.group(1) in ("root", "www-data", "nobody", "postgres", "backup", "ubuntu", "ec2-user") or \
-                (user_then_command and "/" in user_then_command.group(2)[:1]):
-            lines.append(f"runs as {user_then_command.group(1)}: {preview(user_then_command.group(2), 80)}  (system crontab format)")
+        m = re.match(r"([a-z_][a-z0-9_-]{0,31})\s+(.+)$", command)
+        known_users = ("root", "www-data", "nobody", "postgres", "backup", "ubuntu", "ec2-user")
+        if m and (m.group(1) in known_users or "/" in m.group(2) or m.group(2).startswith(("./", "~"))):
+            lines.append(f"runs as {m.group(1)}: {preview(m.group(2), 80)}  (system crontab format)")
         else:
             lines.append(f"runs: {preview(command, 90)}")
         if ">" not in command and "|" not in command and "MAILTO" not in text:
             lines.append("output is mailed to the crontab owner unless redirected (>> /var/log/x.log 2>&1)")
-    if seconds_field:
-        lines.append(f"6 fields: leading seconds field {seconds_field!r} (Quartz/Spring style, not Unix cron)")
+    if seconds_field is not None:
+        lines.append(f"6 fields: leading seconds field {seconds_field.text!r} (Quartz/Spring style, not Unix cron)")
     if not (dom.star or dow.star):
         lines.append("day-of-month AND weekday both restricted: Unix cron fires when EITHER matches")
     if upcoming:
         for d in upcoming:
-            lines.append(f"next: {fmt(d, seconds=False)}  ({relative(d, ctx.now)})")
+            lines.append(f"next: {fmt(d, seconds=seconds_field is not None)}  ({relative(d, ctx.now)})")
     else:
         lines.append("no run found in the next 5 years (impossible date like Feb 30?)")
     lines.extend(notes)
     if len(ctx.zones) > 1 and upcoming:
         other = ctx.zones[1]
-        lines.append(f"first run in {zone_key(other)}: {fmt(upcoming[0], other, seconds=False)}")
+        lines.append(f"first run in {zone_key(other)}: {fmt(upcoming[0], other, seconds=seconds_field is not None)}")
     lines.append(f"evaluated in {zone_key(ctx.zone)}; cron uses the daemon's local zone (TZ= or CRON_TZ= can override)")
-    systemd = cron_to_systemd(*fields)
+    systemd = cron_to_systemd(*fields, seconds=seconds_field)
     if systemd:
         lines.append(f"systemd OnCalendar={systemd}")
         receipt = f"systemd-analyze calendar {q(systemd)}"
     else:
         receipt = None
-    data = {"english": english, "next": [iso(d) for d in upcoming], "systemd": systemd}
-    conf = 0.97 if alias or seconds_field is None and any(c in text for c in "*/,-") or len(set(parts)) > 2 else 0.6
+    data = {"english": english, "next": [iso(d) for d in upcoming], "systemd": systemd,
+            "seconds": seconds_field.text if seconds_field else None}
+    conf = 0.97 if alias or (seconds_field is None and any(c in text for c in "*/,-")) or len(set(parts)) > 2 else 0.6
     if len(set(parts)) == 1 and parts[0].isdigit():
         conf = 0.4   # "1 1 1 1 1" is probably not a schedule
     if command and conf < 0.97:
         conf = 0.85  # five schedule-ish fields followed by a command: that is a crontab line
     summary = english[0].upper() + english[1:]
     if upcoming:
-        summary += f"; next {upcoming[0].strftime('%a %H:%M')}"
+        summary += f"; next {upcoming[0].strftime('%a %H:%M:%S' if seconds_field else '%a %H:%M')}"
     if command:
         summary += f"  ->  {preview(command, 40)}"
     return [Reading("cron", conf, summary, lines, receipt, data=data)]
@@ -1180,15 +1238,19 @@ def detect_strftime(s: str, ctx: Context):
     codes = re.findall(r"%:?[a-zA-Z%]", s)
     if not codes or len(s) > 80 or not all(c in STRFTIME for c in codes):
         return None
-    if len(codes) < 2 and "%" + s.strip("%") == s:
-        pass
     try:
         rendered = ctx.now.astimezone(ctx.zone).strftime(s.replace("%N", f"{(ctx.now.microsecond * 1000):09d}").replace("%:z", "%z"))
     except ValueError:
         return None
     lines = [f"now: {clean(rendered)}"]
     lines.extend(f"{c}  {STRFTIME[c]}" for c in dict.fromkeys(codes))
-    receipt = f"date +{s}" if re.fullmatch(r"[\w%:+-]+", s) else f"date {q('+' + s)}"
+    if "%f" in s or "%N" in s:
+        # GNU date has %N but not %f; Python has %f but not %N. One portable receipt covers both.
+        py = ("python3 -c 'import datetime,sys; n=datetime.datetime.now().astimezone(); "
+              "print(n.strftime(sys.argv[1].replace(\"%N\", f\"{n.microsecond*1000:09d}\")))'")
+        receipt = f"{py} {q(s)}"
+    else:
+        receipt = f"date +{s}" if re.fullmatch(r"[\w%:+-]+", s) else f"date {q('+' + s)}"
     return [Reading("strftime", 0.85 if len(codes) > 1 or s.startswith("%") else 0.5,
                     f"date/strftime format -> {clean(rendered)}", lines, receipt)]
 
@@ -1255,8 +1317,7 @@ def detect_base64(s: str, ctx: Context):
     if re.fullmatch(r"[0-9a-fA-F]+", compact) and len(compact) % 2 == 0:
         conf -= 0.15  # looks more like hex
     conf = max(0.05, min(0.97, conf))
-    flags = " -d" if url_safe is False else " -d"
-    decode_cmd = f"base64{flags}" if not url_safe else "tr '_-' '/+' | base64 -d"
+    decode_cmd = "base64 -d" if not url_safe else "tr '_-' '/+' | base64 -d"
     pad_note = "" if compact.endswith("=") or len(compact) % 4 == 0 else "   # (coreutils base64 wants padding; add = until the length is a multiple of 4)"
     receipt = f"{printf_literal(compact)} | {decode_cmd}" + (" | xxd" if text is None else "") + pad_note
     label = "base64url" if url_safe else "base64"
@@ -1309,12 +1370,17 @@ def detect_url_encoded(s: str, ctx: Context):
     if text is None or text == s:
         return None
     plus_text = urllib.parse.unquote_plus(s) if "+" in s else None
-    lines = [f"-> {preview(text, 96)}"]
+    secret = contains_secret(text) or bool(plus_text and contains_secret(plus_text))
+    shown = redact_text(text) if secret else text
+    lines = [f"-> {preview(shown, 96)}"]
     if plus_text and plus_text != text:
-        lines.append(f"-> {preview(plus_text, 96)}  (if + means space, as in form data)")
-    children = nested(text, ctx)
-    receipt = f"python3 -c 'import sys,urllib.parse; print(urllib.parse.unquote(sys.argv[1]))' {q(s)}"
-    return [Reading("url-encoded", 0.9, f"percent-encoded -> {preview(text, 60)}", lines, receipt, children)]
+        lines.append(f"-> {preview(redact_text(plus_text) if secret else plus_text, 96)}  (if + means space, as in form data)")
+    if secret:
+        lines.append("decoded text looks like a credential: values are masked and no receipt is offered")
+    children = [] if secret else nested(text, ctx)
+    receipt = None if secret else f"python3 -c 'import sys,urllib.parse; print(urllib.parse.unquote(sys.argv[1]))' {q(s)}"
+    return [Reading("url-encoded", 0.9, f"percent-encoded -> {preview(shown, 60)}", lines, receipt, children,
+                    data={"redacted": secret})]
 
 
 @detector
@@ -1327,22 +1393,34 @@ def detect_url(s: str, ctx: Context):
                          f"clone: git clone {clean(s)}"], f"git ls-remote {q(s)}   # lists refs without cloning (needs network)")]
     if len(s) > 4096 or " " in s.strip() or not re.match(r"[a-zA-Z][a-zA-Z0-9+.-]*://\S+|mailto:|^[\w.-]+\.[a-z]{2,}(?:[/?#]\S*)$", s):
         return None
-    u = urllib.parse.urlsplit(s if "://" in s or s.startswith("mailto:") else "//" + s)
+    try:
+        u = urllib.parse.urlsplit(s if "://" in s or s.startswith("mailto:") else "//" + s)
+        hostname = u.hostname
+    except ValueError:
+        return None
     if not (u.netloc or u.scheme == "mailto"):
         return None
+    secret = contains_secret(s)
+    try:
+        port = u.port
+        bad_port = None
+    except ValueError:
+        port = None
+        mport = re.search(r":(\d+)$", u.netloc)
+        bad_port = mport.group(1) if mport else "?"
     lines = []
     if u.scheme:
         lines.append(f"scheme   {u.scheme}")
     if u.username or u.password:
-        lines.append(f"userinfo {u.username or ''}{':<password>' if u.password else ''}   (credentials in a URL leak in logs and history)")
-    if u.hostname:
-        host = u.hostname
+        lines.append(f"userinfo {clean(urllib.parse.unquote(u.username or ''))}{':<password>' if u.password else ''}   (credentials in a URL leak in logs and history)")
+    if hostname:
+        host = hostname
         try:
             host_ascii = host.encode("idna").decode()
         except UnicodeError:
             host_ascii = host
-        lines.append(f"host     {clean(host)}" + (f"  (punycode {host_ascii})" if host_ascii != host else "")
-                     + (f"  port {u.port}" if u.port else ""))
+        port_note = f"  port {port}" if port else (f"  port {bad_port} is out of range (1-65535)" if bad_port else "")
+        lines.append(f"host     {clean(host)}" + (f"  (punycode {host_ascii})" if host_ascii != host else "") + port_note)
         if host.startswith("xn--") or any(part.startswith("xn--") for part in host.split(".")):
             try:
                 lines.append(f"         decodes to {clean(host.encode().decode('idna'))}")
@@ -1354,26 +1432,50 @@ def detect_url(s: str, ctx: Context):
         except ValueError:
             pass
     if u.path and u.path != "/":
-        lines.append(f"path     {clean(urllib.parse.unquote(u.path))}")
+        path_text = urllib.parse.unquote(u.path)
+        lines.append(f"path     {clean(redact_text(path_text) if secret else path_text)}")
     children: list[Reading] = []
-    if u.query:
-        params = urllib.parse.parse_qsl(u.query, keep_blank_values=True)
+    params = urllib.parse.parse_qsl(u.query, keep_blank_values=True) if u.query else []
+    query_secret = False
+    if params:
         lines.append(f"query    {plural(len(params), 'parameter')}")
         for k, v in params[:12]:
-            lines.append(f"  {clean(k)} = {preview(v, 60)}")
-            if ctx.budget[0] > 8 and len(v) >= 6:
+            sensitive = bool(_SENSITIVE_KEY_RE.match(k))
+            value_secret = sensitive or (secret and contains_secret(v))
+            query_secret = query_secret or value_secret
+            shown = "<redacted>" if sensitive else preview(redact_text(v) if secret else v, 60)
+            lines.append(f"  {clean(k)} = {shown}")
+            if not value_secret and ctx.budget[0] > 8 and len(v) >= 6:
                 for r in nested(v, ctx, 0.7, 1):
                     if r.kind not in ("number", "hex", "chmod", "port", "http status", "exit code", "base64"):
                         r.via = k
                         children.append(r)
     if u.fragment:
-        lines.append(f"fragment {preview(u.fragment, 60)}")
-    receipt = f"python3 -c 'import sys,urllib.parse; print(urllib.parse.urlsplit(sys.argv[1]))' {q(s)}"
-    if have("trurl"):
+        lines.append(f"fragment {preview(redact_text(u.fragment) if secret else u.fragment, 60)}")
+    secret = secret or query_secret or bool(u.password)
+    receipt = None if secret else f"python3 -c 'import sys,urllib.parse; print(urllib.parse.urlsplit(sys.argv[1]))' {q(s)}"
+    if receipt and have("trurl"):
         receipt = f"trurl --json {q(s)}"
+    if secret:
+        lines.append("receipt withheld: this URL contains credentials")
     conf = 0.9 if u.scheme else 0.5
-    return [Reading("url", conf, f"URL: {clean(u.hostname or '')}{' ' + clean(urllib.parse.unquote(u.path)) if u.path not in ('', '/') else ''}",
-                    lines, receipt, children)]
+    summary_path = clean(redact_text(urllib.parse.unquote(u.path))) if secret else clean(urllib.parse.unquote(u.path))
+    return [Reading("url", conf, f"URL: {clean(hostname or '')}{' ' + summary_path if u.path not in ('', '/') else ''}",
+                    lines, receipt, children, data={"redacted": secret})]
+
+
+def _json_has_sensitive_key(value, budget: int = 100) -> bool:
+    if budget <= 0:
+        return False
+    if isinstance(value, dict):
+        for k, v in list(value.items())[:40]:
+            if _SENSITIVE_KEY_RE.match(str(k)) or _json_has_sensitive_key(v, budget - 1):
+                return True
+    elif isinstance(value, list):
+        for v in value[:40]:
+            if _json_has_sensitive_key(v, budget - 1):
+                return True
+    return False
 
 
 def _json_walk(value, path: str, ctx: Context, found: list[tuple[str, Reading]], budget: list[int]):
@@ -1410,20 +1512,29 @@ def detect_json(s: str, ctx: Context):
         what = f"JSON object with {plural(len(value), 'key')}"
     else:
         what = f"JSON array with {plural(len(value), 'item')}"
+    secret = contains_secret(s) or _json_has_sensitive_key(value)
     lines = []
     if isinstance(value, dict):
         for k, v in list(value.items())[:8]:
-            lines.append(f"{preview(str(k), 32)}: {preview(json.dumps(v, ensure_ascii=False), 70)}")
+            sensitive = bool(_SENSITIVE_KEY_RE.match(str(k))) or _json_has_sensitive_key(v)
+            dumped = json.dumps(v, ensure_ascii=False)
+            shown = "<redacted>" if sensitive else (redact_text(dumped) if contains_secret(dumped) else dumped)
+            lines.append(f"{preview(str(k), 32)}: {preview(shown, 70)}")
         if len(value) > 8:
             lines.append(f"... {len(value) - 8} more")
+    if secret:
+        lines.append("receipt withheld: this JSON contains a credential")
     found: list[tuple[str, Reading]] = []
     _json_walk(value, "", ctx, found, [12])
     children = []
     for path, r in found[:6]:
         r.via = path
         children.append(r)
-    receipt = f"{printf_literal(s) if len(s) < 500 else 'cat FILE'} | jq ." if have("jq") else f"python3 -m json.tool <<< {q(s)}"
-    return [Reading("json", 0.98, what, lines, receipt, children, data={"keys": list(value)[:40] if isinstance(value, dict) else None})]
+    receipt = None if secret else (
+        f"{printf_literal(s) if len(s) < 500 else 'cat FILE'} | jq ." if have("jq")
+        else f"python3 -m json.tool <<< {q(s)}")
+    return [Reading("json", 0.98, what, lines, receipt, children,
+                    data={"keys": list(value)[:40] if isinstance(value, dict) else None, "redacted": secret})]
 
 
 def b64url_json(segment: str):
@@ -1739,8 +1850,11 @@ def int_facts(n: int) -> list[str]:
 
 
 def num_words(n: int) -> str:
-    """Rough magnitude: 1.7 billion."""
-    for value, word in ((10**12, "trillion"), (10**9, "billion"), (10**6, "million"), (10**3, "thousand")):
+    """Rough magnitude: 1.7 billion, 18.4 quintillion."""
+    if abs(n) >= 10**21:
+        return f"{n:.3g}"
+    for value, word in ((10**18, "quintillion"), (10**15, "quadrillion"), (10**12, "trillion"),
+                        (10**9, "billion"), (10**6, "million"), (10**3, "thousand")):
         if abs(n) >= value:
             return f"{n / value:.3g} {word}"
     return str(n)
@@ -1802,10 +1916,19 @@ def detect_number(s: str, ctx: Context):
         f64 = struct.unpack(">d", (n & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "big"))[0]
         if math.isfinite(f64):
             lines.append(f"as IEEE-754 float64 (big-endian): {f64:.15g}")
-    receipt = f"printf '%d 0x%x 0o%o\\n' {q(raw if base != 2 else str(n))} {q(raw if base != 2 else str(n))} {q(raw if base != 2 else str(n))}" if base != 2 \
-        else f"echo $(( 2#{body} ))"
-    if base == 10 and "," in s:
+    shell_range = -2**63 <= n <= 2**63 - 1
+    if not shell_range:
+        # Shell arithmetic and printf are 64-bit; use Python for bigger integers.
+        py_value = f"int({q(body)}, {base})"
+        if sign < 0:
+            py_value = "-" + py_value
+        receipt = f"python3 -c 'print({py_value})'"
+    elif base == 2:
+        receipt = f"echo $(( {'-2#' if sign < 0 else '2#'}{body} ))"
+    elif base == 10 and "," in s:
         receipt = f"printf '0x%x 0o%o\\n' {n} {n}"
+    else:
+        receipt = f"printf '%d 0x%x 0o%o\\n' {n} {n} {n}"
     label = {16: "hex", 2: "binary", 8: "octal", 10: "integer"}[base]
     summary = f"{label} {commas(n)}" if base != 10 else f"integer {commas(n)}" + (f", {num_words(n)}" if abs(n) >= 10**4 else "")
     if base == 10 and abs(n) < 10**4:
@@ -1888,7 +2011,8 @@ def detect_arithmetic(s: str, ctx: Context):
             lines.append(f"^ read as power; as XOR (C, Python, shells) it would be {xor}")
         except (ValueError, SyntaxError, TypeError, ZeroDivisionError, OverflowError):
             lines.append("^ read as power (in C, Python and shells ^ means XOR)")
-    shell_safe = isinstance(value, int) and not caret_as_power and "**" not in expr and "/" not in expr and "0b" not in expr.lower() and "0o" not in expr.lower()
+    shell_safe = isinstance(value, int) and -2**63 <= value <= 2**63 - 1 and not caret_as_power \
+        and "**" not in expr and "/" not in expr and "0b" not in expr.lower() and "0o" not in expr.lower()
     receipt = f"echo $(( {expr} ))" if shell_safe else f"python3 -c 'print({expr.replace('^', '**') if caret_as_power else expr})'"
     shown = f"{commas(value)}" if isinstance(value, int) else f"{value:.12g}"
     conf = 0.9 if re.search(r"[\da-fA-F]\s*[+\-*/%&|^<>]+\s*[\d(]", expr) or "(" in expr else 0.6
@@ -2215,7 +2339,7 @@ def detect_http_status(s: str, ctx: Context):
     if n in HTTP_HINTS:
         lines.append(HTTP_HINTS[n])
     conf = 0.85 if n in HTTP_HINTS or n in (100, 101, 203, 205, 300, 303, 305, 402, 406, 407, 411, 412, 414, 416, 417, 423, 424, 426, 428, 431, 451, 505, 506, 507, 508, 510, 511) else 0.5
-    receipt = f"curl -sS -o /dev/null -w '%{{http_code}}\\n' URL   # what a URL actually returns"
+    receipt = "curl -sS -o /dev/null -w '%{http_code}\\n' URL   # what a URL actually returns"
     return [Reading("http status", conf, f"HTTP {n} {phrase}: {HTTP_HINTS.get(n, cls)}", lines, receipt, data={"code": n, "phrase": phrase})]
 
 
@@ -2346,13 +2470,25 @@ def detect_color(s: str, ctx: Context):
         how = "hex"
     m = re.fullmatch(r"rgba?\(\s*(\d{1,3})\s*[, ]\s*(\d{1,3})\s*[, ]\s*(\d{1,3})\s*(?:[,/]\s*([\d.]+%?)\s*)?\)", text)
     if m:
-        rgb = tuple(min(255, int(v)) for v in m.groups()[:3])
+        channels = [int(v) for v in m.groups()[:3]]
+        if any(v > 255 for v in channels):
+            return None
+        rgb = tuple(channels)
         if m.group(4):
             alpha = float(m.group(4).rstrip("%")) / (100 if m.group(4).endswith("%") else 1)
+            if not 0 <= alpha <= 1:
+                return None
         how = "rgb()"
     m = re.fullmatch(r"hsla?\(\s*([\d.]+)(?:deg)?\s*[, ]\s*([\d.]+)%\s*[, ]\s*([\d.]+)%\s*(?:[,/]\s*([\d.]+%?)\s*)?\)", text)
     if m:
-        hh, ss_, ll = float(m.group(1)) % 360 / 360, float(m.group(2)) / 100, float(m.group(3)) / 100
+        sat, light = float(m.group(2)), float(m.group(3))
+        if not 0 <= sat <= 100 or not 0 <= light <= 100:
+            return None
+        if m.group(4):
+            alpha = float(m.group(4).rstrip("%")) / (100 if m.group(4).endswith("%") else 1)
+            if not 0 <= alpha <= 1:
+                return None
+        hh, ss_, ll = float(m.group(1)) % 360 / 360, sat / 100, light / 100
         r, g, b = colorsys.hls_to_rgb(hh, ll, ss_)
         rgb = (round(r * 255), round(g * 255), round(b * 255))
         how = "hsl()"
@@ -2517,7 +2653,8 @@ def detect_snowflake(s: str, ctx: Context):
             if name == "Discord" and when > ctx.now - dt.timedelta(days=3650) and len(s) == 19 and s[0] == "1":
                 conf = 0.45  # Discord ids in this range would be recent; Twitter is the older, likelier source
             out.append(Reading("snowflake", conf, f"{name} snowflake id from {fmt(when, ctx.zone, seconds=False)}", lines,
-                               f"date -u -d @$(( ({s} >> 22) + {epoch} ))" if name != "Mastodon" else f"date -u -d @$(( ({s} >> 16) / 1000 ))",
+                               f"date -u -d @$(( (({s} >> 22) + {epoch}) / 1000 ))" if name != "Mastodon"
+                               else f"date -u -d @$(( ({s} >> 16) / 1000 ))",
                                data={"service": name, "iso": iso(when)}))
     return out
 
@@ -2549,9 +2686,12 @@ def special_range(addr) -> str | None:
 def detect_ip(s: str, ctx: Context):
     text = s
     port = None
+    bad_port = None
     m = re.fullmatch(r"\[([0-9a-fA-F:.]+)\]:(\d{1,5})", text) or re.fullmatch(r"(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})", text)
     if m:
         text, port = m.group(1), int(m.group(2))
+        if not 1 <= port <= 65535:
+            bad_port, port = port, None
     if "/" in text:
         return None
     try:
@@ -2587,6 +2727,8 @@ def detect_ip(s: str, ctx: Context):
     if port:
         svc = WELL_KNOWN_PORTS.get(port)
         lines.append(f"port {port}" + (f": {svc}" if svc else ""))
+    elif bad_port is not None:
+        lines.append(f"port {bad_port} is out of range (valid ports are 1-65535)")
     conf = 0.95 if addr.version == 4 and text.count(".") == 3 or addr.version == 6 and ":" in text else 0.6
     receipt = f"python3 -c 'import ipaddress,sys; a=ipaddress.ip_address(sys.argv[1]); print(a.exploded, a.is_private, a.is_global, a.reverse_pointer)' {q(text)}"
     if have("ipcalc") and addr.version == 4:
@@ -2691,7 +2833,7 @@ def detect_mac(s: str, ctx: Context):
         lines.append(f"OUI {digits[:6]}: {vendor}" if vendor else f"OUI {digits[:6]} (universally administered; no local vendor database found to name it)")
     eui64 = f"{first ^ 2:02x}{octets[1]:02x}:{octets[2]:02x}ff:fe{octets[3]:02x}:{octets[4]:02x}{octets[5]:02x}"
     lines.append(f"IPv6 link-local via EUI-64: fe80::{eui64}")
-    lines.append(f"Wake-on-LAN magic packet payload: ff*6 + this address x16")
+    lines.append("Wake-on-LAN magic packet payload: ff*6 + this address x16")
     conf = 0.9 if m.re.pattern.count("\\2") else 0.75
     receipt = f"grep -i {q(digits[:6])} /usr/share/ieee-data/oui.txt" if os.path.exists("/usr/share/ieee-data/oui.txt") else "ip link   # your own interfaces' MACs"
     summary = f"MAC {canonical}: " + ("broadcast" if canonical == "ff:ff:ff:ff:ff:ff" else "locally administered (virtual/randomized)" if first & 2 else
@@ -2718,8 +2860,6 @@ def detect_hash(s: str, ctx: Context):
     name, tool = HASH_LENGTHS[len(text)]
     bits = len(text) * 4
     lines = [f"{len(text)} hex digits = {bits} bits = {bits // 8} bytes: {name}"]
-    if len(text) in (7, 8, 12, 40, 64) or 7 <= len(text) <= 40:
-        pass
     if len(text) == 40:
         lines.append("if from git: a full commit/tree/blob id - try git cat-file -t ID in the repository")
     if len(text) == 32:
@@ -2753,8 +2893,10 @@ def detect_password_hash(s: str, ctx: Context):
     lines = [f"modular crypt format: ${tag}$ = {names[tag]}"]
     if tag.startswith("2"):
         cost = rest[0] if rest and rest[0].isdigit() else rest[0][:2] if rest else ""
-        if cost.isdigit():
+        if cost.isdigit() and len(cost) <= 2 and 4 <= int(cost) <= 31:
             lines.append(f"cost {cost}: 2^{cost} = {commas(2 ** int(cost))} rounds; 10-12 is typical today")
+        elif cost:
+            lines.append(f"cost {preview(cost, 12)}: outside the valid bcrypt range 4-31")
         lines.append("bcrypt truncates passwords at 72 bytes")
     elif tag in ("5", "6") and rest and rest[0].startswith("rounds="):
         lines.append(f"{rest[0]} (default 5000)")
@@ -2765,8 +2907,8 @@ def detect_password_hash(s: str, ctx: Context):
     elif tag == "y" and rest:
         lines.append(f"yescrypt parameters {rest[0]}")
     lines.append("one-way: verify with the same algorithm; to crack you need hashcat/john and a wordlist")
-    return [Reading("password hash", 0.95, f"password hash: {names[tag]}", [ln for ln in lines if ln],
-                    f"python3 -c 'import crypt,sys; print(crypt.crypt(\"password\", sys.argv[1]))' {q(s)}   # compares (Python < 3.13)" if tag in ("1", "5", "6", "y") else None)]
+    # No receipt: the hash itself is sensitive, and Python's crypt module was removed in 3.13.
+    return [Reading("password hash", 0.95, f"password hash: {names[tag]}", [ln for ln in lines if ln], None)]
 
 
 @detector
@@ -2778,7 +2920,7 @@ def detect_sri(s: str, ctx: Context):
     lines = []
     if re.fullmatch(r"[0-9a-f]+", value):
         lines.append(f"{algo} digest in hex (docker image digests look like this: sha256:...)")
-        receipt = f"docker image inspect --format '{{{{.Id}}}}' IMAGE" if algo == "sha256" and len(value) == 64 else None
+        receipt = "docker image inspect --format '{{.Id}}' IMAGE" if algo == "sha256" and len(value) == 64 else None
         what = "digest reference"
     else:
         raw = base64.b64decode(value + "=" * (-len(value) % 4)) if len(value) % 4 != 1 else b""
@@ -2793,11 +2935,17 @@ def git_lookup(oid: str) -> tuple[str, str] | None:
     """(type, one-line description) for an object in the current repository, read-only."""
     if not have("git") or not re.fullmatch(r"[0-9a-f]{4,64}", oid):
         return None
-    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1", LC_ALL="C")
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1",
+               GIT_CONFIG_GLOBAL=os.devnull, LC_ALL="C", LANG="C")
+    deadline = time.monotonic() + GIT_TIMEOUT
 
     def run(*args):
-        return subprocess.run(["git", "--no-pager", "-c", "core.hooksPath=/dev/null", *args], capture_output=True, text=True,
-                              timeout=GIT_TIMEOUT, env=env, stdin=subprocess.DEVNULL)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(args, GIT_TIMEOUT)
+        return subprocess.run(["git", "--no-pager", "-c", "core.hooksPath=/dev/null", *args], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", timeout=remaining, env=env,
+                              stdin=subprocess.DEVNULL)
     try:
         if run("rev-parse", "--is-inside-work-tree").stdout.strip() != "true" and run("rev-parse", "--is-bare-repository").stdout.strip() != "true":
             return None
@@ -2842,7 +2990,7 @@ def detect_ssh_key(s: str, ctx: Context):
             return None
         import hashlib
         fp = base64.b64encode(hashlib.sha256(raw).digest()).decode().rstrip("=")
-        md5 = ":".join(f"{b:02x}" for b in hashlib.md5(raw).digest())
+        md5 = ":".join(f"{b:02x}" for b in hashlib.md5(raw, usedforsecurity=False).digest())
         bits = ""
         if algo == "ssh-rsa" and len(raw) > 20:
             # string "ssh-rsa", mpint e, mpint n
@@ -2872,13 +3020,27 @@ def detect_ssh_key(s: str, ctx: Context):
     return None
 
 
+_BEGIN_PEM = re.compile(r"-----BEGIN ([A-Z0-9 ]{1,64})-----")
+
+
 @detector
 def detect_pem(s: str, ctx: Context):
-    m = re.search(r"-----BEGIN ([A-Z0-9 ]+)-----(.*?)-----END \1-----", s, re.S)
-    if not m:
+    block = None
+    for i, m in enumerate(_BEGIN_PEM.finditer(s)):
+        if i >= 8:
+            break  # a handful of candidates is plenty; keeps hostile input linear
+        label = m.group(1)
+        end = s.find(f"-----END {label}-----", m.end())
+        if end >= 0:
+            block = label, s[m.end():end]
+            break
+    if block is None:
         return None
-    label, body = m.group(1), re.sub(r"\s+", "", m.group(2))
-    body = re.sub(r"^(?:Proc-Type|DEK-Info):.*$", "", body, flags=re.M)
+    label, body_text = block
+    encrypted = "ENCRYPTED" in label or "Proc-Type:" in body_text
+    # MIME headers (Proc-Type/DEK-Info) are not base64; drop them before whitespace collapse.
+    body = re.sub(r"\s+", "", "\n".join(
+        line for line in body_text.splitlines() if not line.startswith(("Proc-Type:", "DEK-Info:"))))
     try:
         raw = base64.b64decode(body, validate=False)
     except (binascii.Error, ValueError):
@@ -2887,7 +3049,7 @@ def detect_pem(s: str, ctx: Context):
     lines = [f"PEM block: {label}, {plural(len(raw), 'byte')} of DER inside"]
     if private:
         lines.append("THIS IS A PRIVATE KEY - do not paste it anywhere, including here; rotate it if it has been shared")
-        if "ENCRYPTED" in label or "Proc-Type" in s:
+        if encrypted:
             lines.append("encrypted with a passphrase")
     if label == "CERTIFICATE":
         lines.append("X.509 certificate; details: openssl x509 -noout -text -in FILE")
@@ -2925,8 +3087,38 @@ SECRET_PATTERNS = (
     (r"tfr\.[A-Za-z0-9_-]+", "Terraform Cloud token"), (r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", None),  # JWT: handled elsewhere
     (r"-----BEGIN [A-Z ]*PRIVATE KEY-----", None),
     (r"(?i)(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp|mssql)://[^:/\s]+:[^@/\s]+@[^\s]+", "database URL with an embedded password"),
+    (r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@[^\s]+", "URL with an embedded password"),
+    (r"(?i)\"(?:api[_-]?key|auth(?:orization)?|credential|key|passwd|password|pwd|secret|sig(?:nature)?|token)\"\s*:\s*\"[^\"]*\"", "JSON field named like a credential"),
     (r"(?i)(?:api[_-]?key|secret|token|password|passwd|pwd)\s*[=:]\s*['\"]?[A-Za-z0-9_\-/+=]{8,}", "a key=value assignment that looks like a credential"),
 )
+
+# Query keys whose values should not be echoed. This is deliberately conservative.
+_SENSITIVE_KEY_RE = re.compile(r"(?i)^(?:api[_-]?key|auth(?:orization)?|credential|key|passwd|password|pwd|secret|sig(?:nature)?|token)$")
+
+
+def contains_secret(text: str) -> bool:
+    """True when the text matches a known credential shape or a URL with a password."""
+    if len(text) > 4096:
+        return False
+    return any(label is not None and re.search(pattern, text) for pattern, label in SECRET_PATTERNS)
+
+
+def redact_text(text: str) -> str:
+    """Best-effort masking for output. Uses the same patterns as detect_secret, plus key=value forms."""
+    if len(text) > 4096:
+        return "<redacted: input too large>"
+    redacted = text
+    for pattern, label in SECRET_PATTERNS:
+        if label is not None:
+            redacted = re.sub(pattern, "<redacted>", redacted)
+    # Generic user:password@, even when the password contains '@'.
+    redacted = re.sub(r"(?i)(\b[a-z][a-z0-9+.-]*://[^/\s:@]+:)[^/\s]+@", r"\1<redacted>@", redacted)
+    # Query-string and key/value forms that the broad patterns may not catch.
+    redacted = re.sub(r"(?i)(\b(?:api[_-]?key|auth|credential|key|passwd|password|pwd|secret|sig|signature|token)=)[^&\s'\"]+",
+                      r"\1<redacted>", redacted)
+    redacted = re.sub(r"(?i)(\b(?:api[_-]?key|auth|credential|key|passwd|password|pwd|secret|sig|signature|token)\s*:\s*)[^\s,;'\"]+",
+                      r"\1<redacted>", redacted)
+    return redacted
 
 
 @detector
@@ -3218,7 +3410,7 @@ def detect_card_number(s: str, ctx: Context):
 
 @detector
 def detect_coordinates(s: str, ctx: Context):
-    m = re.fullmatch(r"([+-]?\d{1,2}(?:\.\d+)?)\s*°?\s*([NS])?\s*,?\s+([+-]?\d{1,3}(?:\.\d+)?)\s*°?\s*([EW])?", s)
+    m = re.fullmatch(r"([+-]?\d{1,2}(?:\.\d+)?)\s*°?\s*([NSns])?\s*,?\s+([+-]?\d{1,3}(?:\.\d+)?)\s*°?\s*([EWew])?", s)
     if not m:
         m = re.fullmatch(r"([+-]?\d{1,2}\.\d+),\s*([+-]?\d{1,3}\.\d+)", s)
         if not m:
@@ -3226,9 +3418,9 @@ def detect_coordinates(s: str, ctx: Context):
         lat, lon = float(m.group(1)), float(m.group(2))
     else:
         lat, lon = float(m.group(1)), float(m.group(3))
-        if m.group(2) == "S":
+        if (m.group(2) or "").upper() == "S":
             lat = -abs(lat)
-        if m.group(4) == "W":
+        if (m.group(4) or "").upper() == "W":
             lon = -abs(lon)
     if not (-90 <= lat <= 90 and -180 <= lon <= 180) or (lat == int(lat) and lon == int(lon)):
         return None
@@ -3276,12 +3468,16 @@ def read_clipboard() -> str:
     commands = (["wl-paste", "--no-newline"], ["xclip", "-selection", "clipboard", "-o"], ["xsel", "--clipboard", "--output"],
                 ["pbpaste"], ["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard"], ["termux-clipboard-get"])
     tried = []
+    deadline = time.monotonic() + CLIP_TIMEOUT
     for cmd in commands:
         if not have(cmd[0]):
             continue
         tried.append(cmd[0])
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            p = subprocess.run(cmd, capture_output=True, timeout=CLIP_TIMEOUT, stdin=subprocess.DEVNULL)
+            p = subprocess.run(cmd, capture_output=True, timeout=remaining, stdin=subprocess.DEVNULL)
         except (OSError, subprocess.SubprocessError):
             continue
         if p.returncode != 0:
@@ -3317,24 +3513,29 @@ def dedupe(readings: list[Reading]) -> list[Reading]:
     return out
 
 
-def render(readings: list[Reading], total: int, verbose: bool, width: int) -> str:
+def render(readings: list[Reading], total: int, width: int) -> str:
     lines_out: list[str] = []
     if not readings:
         return "huh: no idea. Nothing matched - try --all, or check the input for stray quotes/spaces."
+
+    def fit(text: str, limit: int) -> str:
+        # Receipts are deliberately excluded: they must stay copy-pasteable.
+        return text if limit < 60 or len(text) <= limit else text[:limit - 3] + "..."
+
     for i, r in enumerate(readings):
         tag = f"{r.kind}" if r.confidence >= 0.75 else f"{r.kind}?" if r.confidence >= 0.4 else f"{r.kind}??"
         head = f"{tag:<16} {clean(r.summary)}"
-        lines_out.append(head if len(head) <= width or width < 60 else head[: width - 3] + "...")
+        lines_out.append(fit(head, width))
         for ln in r.lines:
-            lines_out.append(f"{'':16} {clean(ln)}")
+            lines_out.append(fit(f"{'':16} {clean(ln)}", width))
         for child in r.children:
             where = f"{clean(child.via)} = " if child.via else ""
-            lines_out.append(f"{'':16}   -> {where}{child.kind}: {clean(child.summary)}")
+            lines_out.append(fit(f"{'':16}   -> {where}{child.kind}: {clean(child.summary)}", width))
             for ln in child.lines[:3]:
-                lines_out.append(f"{'':16}      {clean(ln)}")
+                lines_out.append(fit(f"{'':16}      {clean(ln)}", width))
             for grandchild in child.children[:3]:
                 where = f"{clean(grandchild.via)} = " if grandchild.via else ""
-                lines_out.append(f"{'':16}      -> {where}{grandchild.kind}: {clean(grandchild.summary)}")
+                lines_out.append(fit(f"{'':16}      -> {where}{grandchild.kind}: {clean(grandchild.summary)}", width))
         if r.receipt:
             lines_out.append(f"{'':16} $ {clean(r.receipt)}")
         if i != len(readings) - 1:
@@ -3399,40 +3600,80 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+KIND_OVERRIDES = {
+    "epoch": [k for k, _, _ in EPOCH_UNITS],
+    "passwd_line": ["passwd", "group", "shadow"],
+    "binary_blob": ["binary"],
+    "time_of_day": ["time"],
+    "url_encoded": ["url-encoded"],
+    "mojibake": ["unicode"],  # mojibake readings are unicode readings
+}
+
+KIND_ALIASES = {"mojibake": "unicode", "url encoded": "url-encoded", "url_encoded": "url-encoded",
+                "time of day": "time", "binary blob": "binary"}
+
+
+def normalize_kind(kind: str) -> str:
+    return kind.strip().lower().replace("_", "-").replace(" ", "-")
+
+
 def all_kinds() -> list[str]:
-    """Kinds, in detector order, discovered from the source so --list cannot go stale."""
+    """Kinds, in detector order, with explicit overrides for detectors whose names differ from their readings."""
     kinds: list[str] = []
     for fn in DETECTORS:
-        name = fn.__name__.removeprefix("detect_").replace("_", " ")
-        if name == "epoch":
-            kinds.extend(k for k, _, _ in EPOCH_UNITS)
-        elif name == "passwd line":
-            kinds.extend(["passwd", "group", "shadow"])
-        elif name == "binary blob":
-            kinds.append("binary")
-        elif name == "time of day":
-            kinds.append("time")
-        else:
-            kinds.append(name)
+        name = fn.__name__.removeprefix("detect_")
+        for kind in KIND_OVERRIDES.get(name, [name.replace("_", " ")]):
+            if kind not in kinds:
+                kinds.append(kind)
     return kinds
+
+
+_CLI_FLAGS = {"-a", "--all", "-j", "--json", "--list", "-V", "--version", "-h", "--help", "--"}
+_CLI_VALUE_OPTIONS = {"-t", "--type", "--tz", "--now", "-n", "--max"}
+_CLI_LONG_VALUE_PREFIXES = ("--type=", "--tz=", "--now=", "--max=")
+_MODE_RE = re.compile(r"^[-dlbcpsD][rwxstST-]{9}[.+@]?$")
+_NEGATIVE_RE = re.compile(r"^-\d+(?:\.\d+)?$")
+_CHMOD_SYMBOLIC_RE = re.compile(r"^[ugoa]*[+=-][rwxXstugo]+(?:,[ugoa]*[+=-][rwxXstugo]+)*$")
+
+
+def _looks_like_dash_input(token: str) -> bool:
+    """True for the leading-dash strings huh explains: modes, negative numbers, symbolic chmod."""
+    return bool(_MODE_RE.match(token) or _NEGATIVE_RE.match(token) or _CHMOD_SYMBOLIC_RE.match(token))
+
+
+def _prepare_cli_args(raw_args: list[str]) -> list[str]:
+    """Protect leading-dash *input* with a sentinel, leaving real unknown options for argparse to reject.
+
+    Earlier versions inserted '--' before anything that looked unusual, so '--jsn' quietly became input.
+    """
+    prepared: list[str] = []
+    after_double_dash = False
+    for i, token in enumerate(raw_args):
+        if after_double_dash:
+            prepared.append(token)
+            continue
+        if token == "--":
+            after_double_dash = True
+            prepared.append(token)
+            continue
+        previous_takes_value = i > 0 and raw_args[i - 1] in _CLI_VALUE_OPTIONS
+        known = token in _CLI_FLAGS or token in _CLI_VALUE_OPTIONS or token.startswith(_CLI_LONG_VALUE_PREFIXES)
+        prepared.append("\x00" + token if not known and not previous_takes_value and _looks_like_dash_input(token) else token)
+    return prepared
 
 
 def main(argv: list[str] | None = None) -> int:
     raw_args = list(sys.argv[1:] if argv is None else argv)
-    # "huh -rwxr-xr-x" and "huh -1": things that start with '-' but are input, not options.
-    fixed: list[str] = []
-    for i, a in enumerate(raw_args):
-        if a.startswith("-") and a not in ("-a", "--all", "-j", "--json", "-t", "--type", "--tz", "--now", "--list", "-n", "--max", "-V", "--version", "-h", "--help", "--") \
-                and not a.startswith(("--tz=", "--type=", "--now=", "--max=")) and (i == 0 or raw_args[i - 1] not in ("-t", "--type", "--tz", "--now", "-n", "--max")) \
-                and "--" not in fixed:
-            fixed.append("--")
-        fixed.append(a)
     parser = build_parser()
-    args = parser.parse_args(fixed)
+    args = parser.parse_args(_prepare_cli_args(raw_args))
+    if args.text:
+        args.text = [t[1:] if t.startswith("\x00") else t for t in args.text]
     if args.list:
         for k in all_kinds():
             print(k)
         return 0
+    if args.max < 1:
+        parser.error("--max must be at least 1")
     try:
         zones = parse_zones(args.tz)
     except ValueError as e:
@@ -3464,8 +3705,9 @@ def main(argv: list[str] | None = None) -> int:
     ctx = Context(now=now, zones=zones)
     readings = dedupe(decode(text, ctx))
     if args.type:
-        wanted = {k.strip().lower() for k in args.type.split(",")}
-        readings = [r for r in readings if r.kind in wanted or r.kind.replace(" ", "-") in wanted or r.kind.split()[0] in wanted]
+        wanted = {normalize_kind(KIND_ALIASES.get(k.strip().lower(), k)) for k in args.type.split(",") if k.strip()}
+        readings = [r for r in readings
+                    if normalize_kind(r.kind) in wanted or normalize_kind(r.kind).split("-")[0] in wanted]
     total = len(readings)
     if args.all:
         shown = readings
@@ -3474,10 +3716,15 @@ def main(argv: list[str] | None = None) -> int:
         floor = 0.25 if readings and readings[0].confidence >= 0.75 else 0.1
         shown = [r for r in readings if r.confidence >= floor][: max(1, args.max)] or readings[:1]
     if args.json:
-        print(json.dumps({"input": text, "readings": [r.to_dict() for r in shown], "hidden": total - len(shown)}, indent=2, ensure_ascii=False, default=str))
-        return 0
+        safe_text = redact_text(text) if contains_secret(text) else text
+        payload = {"input": safe_text, "readings": [r.to_dict() for r in shown], "hidden": total - len(shown)}
+        if safe_text != text:
+            payload["input_redacted"] = True
+        # ensure_ascii=True keeps bidi overrides and other format characters out of terminal/log output.
+        print(json.dumps(payload, indent=2, ensure_ascii=True, default=str))
+        return 0 if readings else 1
     width = shutil.get_terminal_size((100, 24)).columns if sys.stdout.isatty() else 10_000
-    print(render(shown, total, args.all, width))
+    print(render(shown, total, width))
     return 0 if readings else 1
 
 

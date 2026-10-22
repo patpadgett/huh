@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "whatsthis"
-version = "0.1.0"
+dynamic = ["version"]
 description = "huh: what is this string? Ranked readings of timestamps, tokens, cron lines, modes, hashes, colours and addresses - offline, with the Unix one-liner that reproduces each answer."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,6 +21,11 @@ classifiers = [
   "Operating System :: MacOS",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Utilities",
   "Topic :: System :: Systems Administration",
 ]
@@ -28,6 +33,7 @@ dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/patpadgett/huh"
+Repository = "https://github.com/patpadgett/huh"
 Issues = "https://github.com/patpadgett/huh/issues"
 
 [project.scripts]
@@ -35,3 +41,6 @@ huh = "huh:main"
 
 [tool.setuptools]
 py-modules = ["huh"]
+
+[tool.setuptools.dynamic]
+version = {attr = "huh.__version__"}
