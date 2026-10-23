@@ -1,5 +1,11 @@
 # huh
 
+[![CI](https://github.com/patpadgett/huh/actions/workflows/tests.yml/badge.svg)](https://github.com/patpadgett/huh/actions/workflows/tests.yml)
+[![PyPI](https://img.shields.io/pypi/v/whatsthis.svg)](https://pypi.org/project/whatsthis/)
+[![Python](https://img.shields.io/pypi/pyversions/whatsthis.svg)](https://pypi.org/project/whatsthis/)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Dependencies](https://img.shields.io/badge/dependencies-zero-success.svg)](pyproject.toml)
+
 **What is this string?**
 
 `huh` is the terminal answer to every browser tab you open to decode something.
