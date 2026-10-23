@@ -470,20 +470,17 @@ def resolve_zone(token: str) -> tuple[dt.tzinfo, str, list[str]] | None:
     if not t:
         return None
     if "/" in t or t in ("UTC", "GMT", "Zulu", "Z", "UCT", "Universal"):
-        name = {"Z": "UTC", "Zulu": "UTC"}.get(t, t)
+        if "/" in t:
+            # macOS filesystems are case-insensitive, so ZoneInfo("asia/tokyo") can
+            # succeed and keep the user's spelling. Canonicalize through the zone list.
+            if _ZONE_BY_LOWER is None:
+                _ZONE_BY_LOWER = {z.lower(): z for z in available_timezones()}
+            name = _ZONE_BY_LOWER.get(t.lower(), t)
+        else:
+            name = {"Z": "UTC", "Zulu": "UTC"}.get(t, t)
         try:
             return ZoneInfo(name), name, []
         except (ZoneInfoNotFoundError, ValueError, OSError):
-            if "/" not in t:
-                return None
-            if _ZONE_BY_LOWER is None:
-                _ZONE_BY_LOWER = {z.lower(): z for z in available_timezones()}
-            canonical = _ZONE_BY_LOWER.get(t.lower())
-            if canonical:
-                try:
-                    return ZoneInfo(canonical), canonical, []
-                except (ZoneInfoNotFoundError, ValueError, OSError):
-                    pass
             return None
     m = OFFSET_RE.fullmatch(t)
     if m:
